@@ -5,9 +5,9 @@ import (
 	"io/ioutil"
 	"os"
 	"syscall"
-
-	sys "golang.org/x/sys/unix"
 )
+
+//lint:file-ignore ST1005 errors here can be capitalized
 
 func attachErrorMessage(pid int, err error) error {
 	fallbackerr := fmt.Errorf("could not attach to pid %d: %s", pid, err)
@@ -29,8 +29,4 @@ func attachErrorMessage(pid int, err error) error {
 		}
 	}
 	return fallbackerr
-}
-
-func stopProcess(pid int) error {
-	return sys.Kill(pid, sys.SIGSTOP)
 }

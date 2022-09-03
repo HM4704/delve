@@ -5,8 +5,14 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/elfwriter"
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 )
+
+// ErrNoThreads core file did not contain any threads.
+var ErrNoThreads = errors.New("no threads found in core file")
 
 // A splicedMemory represents a memory space formed from multiple regions,
 // each of which may override previously regions. For example, in the following
@@ -15,10 +21,12 @@ import (
 // 0x0000000000400000  0x000000000044f000  0x0000000000000000
 // but then it's partially overwritten with an RW mapping whose data is stored
 // in the core file:
-// Type           Offset             VirtAddr           PhysAddr
-//                FileSiz            MemSiz              Flags  Align
-// LOAD           0x0000000000004000 0x000000000049a000 0x0000000000000000
-//                0x0000000000002000 0x0000000000002000  RW     1000
+//
+//	Type           Offset             VirtAddr           PhysAddr
+//	               FileSiz            MemSiz              Flags  Align
+//	LOAD           0x0000000000004000 0x000000000049a000 0x0000000000000000
+//	               0x0000000000002000 0x0000000000002000  RW     1000
+//
 // This can be represented in a SplicedMemory by adding the original region,
 // then putting the RW mapping on top of it.
 type splicedMemory struct {
@@ -26,13 +34,13 @@ type splicedMemory struct {
 }
 
 type readerEntry struct {
-	offset uintptr
-	length uintptr
+	offset uint64
+	length uint64
 	reader proc.MemoryReader
 }
 
 // Add adds a new region to the SplicedMemory, which may override existing regions.
-func (r *splicedMemory) Add(reader proc.MemoryReader, off, length uintptr) {
+func (r *splicedMemory) Add(reader proc.MemoryReader, off, length uint64) {
 	if length == 0 {
 		return
 	}
@@ -92,10 +100,10 @@ func (r *splicedMemory) Add(reader proc.MemoryReader, off, length uintptr) {
 }
 
 // ReadMemory implements MemoryReader.ReadMemory.
-func (r *splicedMemory) ReadMemory(buf []byte, addr uintptr) (n int, err error) {
+func (r *splicedMemory) ReadMemory(buf []byte, addr uint64) (n int, err error) {
 	started := false
 	for _, entry := range r.readers {
-		if entry.offset+entry.length < addr {
+		if entry.offset+entry.length <= addr {
 			if !started {
 				continue
 			}
@@ -107,7 +115,7 @@ func (r *splicedMemory) ReadMemory(buf []byte, addr uintptr) (n int, err error) 
 
 		// Don't go past the region.
 		pb := buf
-		if addr+uintptr(len(buf)) > entry.offset+entry.length {
+		if addr+uint64(len(buf)) > entry.offset+entry.length {
 			pb = pb[:entry.offset+entry.length-addr]
 		}
 		pn, err := entry.reader.ReadMemory(pb, addr)
@@ -119,7 +127,7 @@ func (r *splicedMemory) ReadMemory(buf []byte, addr uintptr) (n int, err error) 
 			return n, nil
 		}
 		buf = buf[pn:]
-		addr += uintptr(pn)
+		addr += uint64(pn)
 		if len(buf) == 0 {
 			// Done, don't bother scanning the rest.
 			return n, nil
@@ -138,11 +146,11 @@ func (r *splicedMemory) ReadMemory(buf []byte, addr uintptr) (n int, err error) 
 // to return the results of a read in that part of the address space.
 type offsetReaderAt struct {
 	reader io.ReaderAt
-	offset uintptr
+	offset uint64
 }
 
 // ReadMemory will read the memory at addr-offset.
-func (r *offsetReaderAt) ReadMemory(buf []byte, addr uintptr) (n int, err error) {
+func (r *offsetReaderAt) ReadMemory(buf []byte, addr uint64) (n int, err error) {
 	return r.reader.ReadAt(buf, int64(addr-r.offset))
 }
 
@@ -154,12 +162,9 @@ type process struct {
 
 	entryPoint uint64
 
-	bi            *proc.BinaryInfo
-	breakpoints   proc.BreakpointMap
-	currentThread *thread
+	bi          *proc.BinaryInfo
+	breakpoints proc.BreakpointMap
 }
-
-var _ proc.ProcessInternal = &process{}
 
 // thread represents a thread in the core file being debugged.
 type thread struct {
@@ -188,9 +193,9 @@ var (
 	ErrChangeRegisterCore = errors.New("can not change register values of core process")
 )
 
-type openFn func(string, string) (*process, error)
+type openFn func(string, string) (*process, proc.Thread, error)
 
-var openFns = []openFn{readLinuxCore, readAMD64Minidump}
+var openFns = []openFn{readLinuxOrPlatformIndependentCore, readAMD64Minidump}
 
 // ErrUnrecognizedFormat is returned when the core file is not recognized as
 // any of the supported formats.
@@ -201,9 +206,10 @@ var ErrUnrecognizedFormat = errors.New("unrecognized core format")
 // for external debug files in the directories passed in.
 func OpenCore(corePath, exePath string, debugInfoDirs []string) (*proc.Target, error) {
 	var p *process
+	var currentThread proc.Thread
 	var err error
 	for _, openFn := range openFns {
-		p, err = openFn(corePath, exePath)
+		p, currentThread, err = openFn(corePath, exePath)
 		if err != ErrUnrecognizedFormat {
 			break
 		}
@@ -212,11 +218,18 @@ func OpenCore(corePath, exePath string, debugInfoDirs []string) (*proc.Target, e
 		return nil, err
 	}
 
-	return proc.NewTarget(p, proc.NewTargetConfig{
+	if currentThread == nil {
+		return nil, ErrNoThreads
+	}
+
+	return proc.NewTarget(p, p.pid, currentThread, proc.NewTargetConfig{
 		Path:                exePath,
 		DebugInfoDirs:       debugInfoDirs,
 		DisableAsyncPreempt: false,
-		StopReason:          proc.StopAttached})
+		StopReason:          proc.StopAttached,
+		CanDump:             false,
+		ContinueOnce:        continueOnce,
+	})
 }
 
 // BinInfo will return the binary info.
@@ -231,15 +244,17 @@ func (p *process) EntryPoint() (uint64, error) {
 
 // WriteBreakpoint is a noop function since you
 // cannot write breakpoints into core files.
-func (p *process) WriteBreakpoint(addr uint64) (file string, line int, fn *proc.Function, originalData []byte, err error) {
-	return "", 0, nil, nil, errors.New("cannot write a breakpoint to a core file")
+func (p *process) WriteBreakpoint(*proc.Breakpoint) error {
+	return errors.New("cannot write a breakpoint to a core file")
 }
 
 // Recorded returns whether this is a live or recorded process. Always returns true for core files.
 func (p *process) Recorded() (bool, string) { return true, "" }
 
 // Restart will only return an error for core files, as they are not executing.
-func (p *process) Restart(string) error { return ErrContinueCore }
+func (p *process) Restart(*proc.ContinueOnceContext, string) (proc.Thread, error) {
+	return nil, ErrContinueCore
+}
 
 // ChangeDirection will only return an error as you cannot continue a core process.
 func (p *process) ChangeDirection(proc.Direction) error { return ErrContinueCore }
@@ -259,11 +274,30 @@ func (p *process) Checkpoints() ([]proc.Checkpoint, error) { return nil, nil }
 // ClearCheckpoint clears a checkpoint, but will only return an error for core files.
 func (p *process) ClearCheckpoint(int) error { return errors.New("checkpoint not found") }
 
+func (p *process) SupportsBPF() bool {
+	return false
+}
+
+func (dbp *process) SetUProbe(fnName string, goidOffset int64, args []ebpf.UProbeArgMap) error {
+	panic("not implemented")
+}
+
+// StartCallInjection notifies the backend that we are about to inject a function call.
+func (p *process) StartCallInjection() (func(), error) { return func() {}, nil }
+
+func (dbp *process) EnableURetProbes() error {
+	panic("not implemented")
+}
+
+func (dbp *process) DisableURetProbes() error {
+	panic("not implemented")
+}
+
 // ReadMemory will return memory from the core file at the specified location and put the
 // read memory into `data`, returning the length read, and returning an error if
 // the length read is shorter than the length of the `data` buffer.
-func (t *thread) ReadMemory(data []byte, addr uintptr) (n int, err error) {
-	n, err = t.p.mem.ReadMemory(data, addr)
+func (p *process) ReadMemory(data []byte, addr uint64) (n int, err error) {
+	n, err = p.mem.ReadMemory(data, addr)
 	if err == nil && n != len(data) {
 		err = ErrShortRead
 	}
@@ -272,8 +306,13 @@ func (t *thread) ReadMemory(data []byte, addr uintptr) (n int, err error) {
 
 // WriteMemory will only return an error for core files, you cannot write
 // to the memory of a core process.
-func (t *thread) WriteMemory(addr uintptr, data []byte) (int, error) {
+func (p *process) WriteMemory(addr uint64, data []byte) (int, error) {
 	return 0, ErrWriteCore
+}
+
+// ProcessMemory returns the memory of this thread's process.
+func (t *thread) ProcessMemory() proc.MemoryReadWriter {
+	return t.p
 }
 
 // Location returns the location of this thread based on
@@ -322,16 +361,15 @@ func (t *thread) StepInstruction() error {
 	return ErrContinueCore
 }
 
-// Blocked will return false always for core files as there is
-// no execution.
-func (t *thread) Blocked() bool {
-	return false
-}
-
 // SetCurrentBreakpoint will always just return nil
 // for core files, as there are no breakpoints in core files.
 func (t *thread) SetCurrentBreakpoint(adjustPC bool) error {
 	return nil
+}
+
+// SoftExc returns true if this thread received a software exception during the last resume.
+func (t *thread) SoftExc() bool {
+	return false
 }
 
 // Common returns a struct containing common information
@@ -358,6 +396,12 @@ func (t *thread) SetDX(uint64) error {
 	return ErrChangeRegisterCore
 }
 
+// ChangeRegs will always return an error, you cannot
+// change register values when debugging core files.
+func (t *thread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
+	return ErrChangeRegisterCore
+}
+
 // Breakpoints will return all breakpoints for the process.
 func (p *process) Breakpoints() *proc.BreakpointMap {
 	return &p.breakpoints
@@ -375,9 +419,7 @@ func (p *process) ClearInternalBreakpoints() error {
 	return nil
 }
 
-// ContinueOnce will always return an error because you
-// cannot control execution of a core file.
-func (p *process) ContinueOnce() (proc.Thread, proc.StopReason, error) {
+func continueOnce(procs []proc.ProcessInternal, cctx *proc.ContinueOnceContext) (proc.Thread, proc.StopReason, error) {
 	return nil, proc.StopUnknown, ErrContinueCore
 }
 
@@ -389,7 +431,7 @@ func (p *process) StepInstruction() error {
 
 // RequestManualStop will return nil and have no effect
 // as you cannot control execution of a core file.
-func (p *process) RequestManualStop() error {
+func (p *process) RequestManualStop(cctx *proc.ContinueOnceContext) error {
 	return nil
 }
 
@@ -400,9 +442,9 @@ func (p *process) CheckAndClearManualStopRequest() bool {
 	return false
 }
 
-// CurrentThread returns the current active thread.
-func (p *process) CurrentThread() proc.Thread {
-	return p.currentThread
+// Memory returns the process memory.
+func (p *process) Memory() proc.MemoryReadWriter {
+	return p
 }
 
 // Detach will always return nil and have no
@@ -416,11 +458,6 @@ func (p *process) Detach(bool) error {
 // for core files as it cannot exit or be otherwise detached from.
 func (p *process) Valid() (bool, error) {
 	return true, nil
-}
-
-// Pid returns the process ID of this process.
-func (p *process) Pid() int {
-	return p.pid
 }
 
 // ResumeNotify is a no-op on core files as we cannot
@@ -443,7 +480,14 @@ func (p *process) FindThread(threadID int) (proc.Thread, bool) {
 	return t, ok
 }
 
-// SetCurrentThread is used internally by proc.Target to change the current thread.
-func (p *process) SetCurrentThread(th proc.Thread) {
-	p.currentThread = th.(*thread)
+func (p *process) MemoryMap() ([]proc.MemoryMapEntry, error) {
+	return nil, proc.ErrMemoryMapNotSupported
+}
+
+func (p *process) DumpProcessNotes(notes []elfwriter.Note, threadDone func()) (threadsDone bool, out []elfwriter.Note, err error) {
+	return false, notes, nil
+}
+
+func (dbp *process) GetBufferedTracepoints() []ebpf.RawUProbeParams {
+	return nil
 }

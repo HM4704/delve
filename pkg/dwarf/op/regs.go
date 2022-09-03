@@ -14,11 +14,12 @@ type DwarfRegisters struct {
 	ObjBase   int64
 	regs      []*DwarfRegister
 
-	ByteOrder binary.ByteOrder
-	PCRegNum  uint64
-	SPRegNum  uint64
-	BPRegNum  uint64
-	LRRegNum  uint64
+	ByteOrder  binary.ByteOrder
+	PCRegNum   uint64
+	SPRegNum   uint64
+	BPRegNum   uint64
+	LRRegNum   uint64
+	ChangeFunc RegisterChangeFunc
 
 	FloatLoadError   error // error produced when loading floating point registers
 	loadMoreCallback func()
@@ -28,6 +29,8 @@ type DwarfRegister struct {
 	Uint64Val uint64
 	Bytes     []byte
 }
+
+type RegisterChangeFunc func(regNum uint64, reg *DwarfRegister) error
 
 // NewDwarfRegisters returns a new DwarfRegisters object.
 func NewDwarfRegisters(staticBase uint64, regs []*DwarfRegister, byteOrder binary.ByteOrder, pcRegNum, spRegNum, bpRegNum, lrRegNum uint64) *DwarfRegisters {
@@ -151,4 +154,30 @@ func DwarfRegisterFromBytes(bytes []byte) *DwarfRegister {
 		}
 	}
 	return &DwarfRegister{Uint64Val: v, Bytes: bytes}
+}
+
+// FillBytes fills the Bytes slice of reg using Uint64Val.
+func (reg *DwarfRegister) FillBytes() {
+	if reg.Bytes != nil {
+		return
+	}
+	reg.Bytes = make([]byte, 8)
+	binary.LittleEndian.PutUint64(reg.Bytes, reg.Uint64Val)
+}
+
+// Overwrite takes the contents of reg1 and overwrites them with the contents
+// of reg2 in little-endian order, returning a new register. The new register
+// will always contain the complete contents of both registers, so if reg2 is
+// larger than reg1, the final register will be reg2's size.
+func (reg1 *DwarfRegister) Overwrite(reg2 *DwarfRegister) *DwarfRegister {
+	reg1.FillBytes()
+	reg2.FillBytes()
+	width := len(reg1.Bytes)
+	if len(reg2.Bytes) > len(reg1.Bytes) {
+		width = len(reg2.Bytes)
+	}
+	b := make([]byte, width)
+	copy(b, reg1.Bytes)
+	copy(b, reg2.Bytes)
+	return DwarfRegisterFromBytes(b)
 }

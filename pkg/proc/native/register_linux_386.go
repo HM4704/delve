@@ -5,12 +5,15 @@ import (
 
 	sys "golang.org/x/sys/unix"
 
+	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/amd64util"
 	"github.com/go-delve/delve/pkg/proc/linutil"
 )
 
-// SetPC sets EIP to the value specified by 'pc'.
-func (thread *nativeThread) SetPC(pc uint64) error {
+// setPC sets EIP to the value specified by 'pc'.
+func (thread *nativeThread) setPC(pc uint64) error {
 	ir, err := registers(thread)
 	if err != nil {
 		return err
@@ -21,29 +24,26 @@ func (thread *nativeThread) SetPC(pc uint64) error {
 	return err
 }
 
-// SetSP sets ESP to the value specified by 'sp'
-func (thread *nativeThread) SetSP(sp uint64) (err error) {
-	var ir proc.Registers
-	ir, err = registers(thread)
+func (thread *nativeThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
+	ir, err := registers(thread)
 	if err != nil {
 		return err
 	}
 	r := ir.(*linutil.I386Registers)
-	r.Regs.Esp = int32(sp)
-	thread.dbp.execPtraceFunc(func() { err = sys.PtraceSetRegs(thread.ID, (*sys.PtraceRegs)(r.Regs)) })
-	return
-}
-
-func (thread *nativeThread) SetDX(dx uint64) (err error) {
-	var ir proc.Registers
-	ir, err = registers(thread)
-	if err != nil {
-		return err
+	switch regNum {
+	case regnum.I386_Eip:
+		r.Regs.Eip = int32(reg.Uint64Val)
+	case regnum.I386_Esp:
+		r.Regs.Esp = int32(reg.Uint64Val)
+	case regnum.I386_Edx:
+		r.Regs.Edx = int32(reg.Uint64Val)
+	default:
+		//TODO(aarzilli): when the register calling convention is adopted by Go on
+		// i386 this should be implemented.
+		return fmt.Errorf("changing register %d not implemented", regNum)
 	}
-	r := ir.(*linutil.I386Registers)
-	r.Regs.Edx = int32(dx)
 	thread.dbp.execPtraceFunc(func() { err = sys.PtraceSetRegs(thread.ID, (*sys.PtraceRegs)(r.Regs)) })
-	return
+	return err
 }
 
 func registers(thread *nativeThread) (proc.Registers, error) {
@@ -56,7 +56,7 @@ func registers(thread *nativeThread) (proc.Registers, error) {
 		return nil, err
 	}
 	r := linutil.NewI386Registers(&regs, func(r *linutil.I386Registers) error {
-		var fpregset linutil.I386Xstate
+		var fpregset amd64util.AMD64Xstate
 		var floatLoadError error
 		r.Fpregs, fpregset, floatLoadError = thread.fpRegisters()
 		r.Fpregset = &fpregset
@@ -69,17 +69,9 @@ func registers(thread *nativeThread) (proc.Registers, error) {
 	return r, nil
 }
 
-const (
-	_X86_XSTATE_MAX_SIZE = 2688
-	_NT_X86_XSTATE       = 0x202
+const _NT_X86_XSTATE = 0x202
 
-	_XSAVE_HEADER_START          = 512
-	_XSAVE_HEADER_LEN            = 64
-	_XSAVE_EXTENDED_REGION_START = 576
-	_XSAVE_SSE_REGION_LEN        = 416
-)
-
-func (thread *nativeThread) fpRegisters() (regs []proc.Register, fpregs linutil.I386Xstate, err error) {
+func (thread *nativeThread) fpRegisters() (regs []proc.Register, fpregs amd64util.AMD64Xstate, err error) {
 	thread.dbp.execPtraceFunc(func() { fpregs, err = ptraceGetRegset(thread.ID) })
 	regs = fpregs.Decode()
 	if err != nil {

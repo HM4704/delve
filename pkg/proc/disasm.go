@@ -1,6 +1,10 @@
 package proc
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/go-delve/delve/pkg/dwarf/op"
+)
 
 // AsmInstruction represents one assembly instruction.
 type AsmInstruction struct {
@@ -56,7 +60,7 @@ type AssemblyFlavour int
 
 const (
 	// GNUFlavour will display GNU assembly syntax.
-	GNUFlavour = AssemblyFlavour(iota)
+	GNUFlavour AssemblyFlavour = iota
 	// IntelFlavour will display Intel assembly syntax.
 	IntelFlavour
 	// GoFlavour will display Go assembly syntax.
@@ -71,7 +75,7 @@ type opcodeSeq []uint64
 // If sameline is set firstPCAfterPrologueDisassembly will always return an
 // address associated with the same line as fn.Entry
 func firstPCAfterPrologueDisassembly(p Process, fn *Function, sameline bool) (uint64, error) {
-	var mem MemoryReadWriter = p.CurrentThread()
+	mem := p.Memory()
 	breakpoints := p.Breakpoints()
 	bi := p.BinInfo()
 	text, err := disassemble(mem, nil, breakpoints, bi, fn.Entry, fn.End, false)
@@ -83,7 +87,7 @@ func firstPCAfterPrologueDisassembly(p Process, fn *Function, sameline bool) (ui
 		return fn.Entry, nil
 	}
 
-	for _, prologue := range p.BinInfo().Arch.Prologues() {
+	for _, prologue := range p.BinInfo().Arch.prologues {
 		if len(prologue) >= len(text) {
 			continue
 		}
@@ -124,8 +128,13 @@ func Disassemble(mem MemoryReadWriter, regs Registers, breakpoints *BreakpointMa
 }
 
 func disassemble(memrw MemoryReadWriter, regs Registers, breakpoints *BreakpointMap, bi *BinaryInfo, startAddr, endAddr uint64, singleInstr bool) ([]AsmInstruction, error) {
+	var dregs *op.DwarfRegisters
+	if regs != nil {
+		dregs = bi.Arch.RegistersToDwarfRegisters(0, regs)
+	}
+
 	mem := make([]byte, int(endAddr-startAddr))
-	_, err := memrw.ReadMemory(mem, uintptr(startAddr))
+	_, err := memrw.ReadMemory(mem, startAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -141,9 +150,7 @@ func disassemble(memrw MemoryReadWriter, regs Registers, breakpoints *Breakpoint
 	for len(mem) > 0 {
 		bp, atbp := breakpoints.M[pc]
 		if atbp {
-			for i := range bp.OriginalData {
-				mem[i] = bp.OriginalData[i]
-			}
+			copy(mem, bp.OriginalData)
 		}
 
 		file, line, fn := bi.PCToLine(pc)
@@ -153,7 +160,7 @@ func disassemble(memrw MemoryReadWriter, regs Registers, breakpoints *Breakpoint
 		inst.Breakpoint = atbp
 		inst.AtPC = (regs != nil) && (curpc == pc)
 
-		bi.Arch.asmDecode(&inst, mem, regs, memrw, bi)
+		bi.Arch.asmDecode(&inst, mem, dregs, memrw, bi)
 
 		r = append(r, inst)
 

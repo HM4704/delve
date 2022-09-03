@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/go-delve/delve/service/api"
+	"github.com/go-delve/delve/service/rpc1"
+	"github.com/go-delve/delve/service/rpc2"
 )
 
 func assertNoError(err error, t *testing.T, s string) {
@@ -63,8 +65,15 @@ type BreakpointLister interface {
 	ListBreakpoints() ([]*api.Breakpoint, error)
 }
 
-func countBreakpoints(t *testing.T, c BreakpointLister) int {
-	bps, err := c.ListBreakpoints()
+func countBreakpoints(t *testing.T, c interface{}) int {
+	var bps []*api.Breakpoint
+	var err error
+	switch c := c.(type) {
+	case *rpc2.RPCClient:
+		bps, err = c.ListBreakpoints(false)
+	case *rpc1.RPCClient:
+		bps, err = c.ListBreakpoints()
+	}
 	assertNoError(err, t, "ListBreakpoints()")
 	bpcount := 0
 	for _, bp := range bps {
@@ -80,7 +89,7 @@ type locationFinder1 interface {
 }
 
 type locationFinder2 interface {
-	FindLocation(api.EvalScope, string, bool) ([]api.Location, error)
+	FindLocation(api.EvalScope, string, bool, [][2]string) ([]api.Location, error)
 }
 
 func findLocationHelper(t *testing.T, c interface{}, loc string, shouldErr bool, count int, checkAddr uint64) []uint64 {
@@ -91,7 +100,7 @@ func findLocationHelper(t *testing.T, c interface{}, loc string, shouldErr bool,
 	case locationFinder1:
 		locs, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, loc)
 	case locationFinder2:
-		locs, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, loc, false)
+		locs, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, loc, false, nil)
 	default:
 		t.Errorf("unexpected type %T passed to findLocationHelper", c)
 	}

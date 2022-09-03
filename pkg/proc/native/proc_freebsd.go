@@ -15,8 +15,15 @@ import (
 	sys "golang.org/x/sys/unix"
 
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 
 	isatty "github.com/mattn/go-isatty"
+)
+
+const (
+	_PL_FLAG_BORN   = 0x100
+	_PL_FLAG_EXITED = 0x200
+	_PL_FLAG_SI     = 0x20
 )
 
 // Process statuses
@@ -37,16 +44,20 @@ type osProcessDetails struct {
 	tid  int
 }
 
+func (os *osProcessDetails) Close() {}
+
 // Launch creates and begins debugging a new process. First entry in
 // `cmd` is the program to run, and then rest are the arguments
 // to be supplied to that process. `wd` is working directory of the program.
 // If the DWARF information cannot be found in the binary, Delve will look
 // for external debug files in the directories passed in.
-func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string, tty string, redirects [3]string) (*proc.Target, error) {
+func Launch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []string, tty string, redirects [3]string) (*proc.Target, error) {
 	var (
 		process *exec.Cmd
 		err     error
 	)
+
+	foreground := flags&proc.LaunchForeground != 0
 
 	stdin, stdout, stderr, closefn, err := openRedirects(redirects, foreground)
 	if err != nil {
@@ -178,8 +189,8 @@ func (dbp *nativeProcess) addThread(tid int, attach bool) (*nativeThread, error)
 		os:  new(osSpecificDetails),
 	}
 
-	if dbp.currentThread == nil {
-		dbp.currentThread = dbp.threads[tid]
+	if dbp.memthread == nil {
+		dbp.memthread = dbp.threads[tid]
 	}
 
 	return dbp.threads[tid], nil
@@ -242,14 +253,14 @@ func (dbp *nativeProcess) trapWaitInternal(pid int, halt bool) (*nativeThread, e
 		}
 
 		if status.StopSignal() == sys.SIGTRAP {
-			if pl_flags&sys.PL_FLAG_EXITED != 0 {
+			if pl_flags&_PL_FLAG_EXITED != 0 {
 				delete(dbp.threads, tid)
 				dbp.execPtraceFunc(func() { err = ptraceCont(tid, 0) })
 				if err != nil {
 					return nil, err
 				}
 				continue
-			} else if pl_flags&sys.PL_FLAG_BORN != 0 {
+			} else if pl_flags&_PL_FLAG_BORN != 0 {
 				th, err = dbp.addThread(int(tid), false)
 				if err != nil {
 					if err == sys.ESRCH {
@@ -345,19 +356,19 @@ func (dbp *nativeProcess) resume() error {
 
 // Used by ContinueOnce
 // stop stops all running threads and sets breakpoints
-func (dbp *nativeProcess) stop(trapthread *nativeThread) (err error) {
+func (dbp *nativeProcess) stop(cctx *proc.ContinueOnceContext, trapthread *nativeThread) (*nativeThread, error) {
 	if dbp.exited {
-		return &proc.ErrProcessExited{Pid: dbp.Pid()}
+		return nil, proc.ErrProcessExited{Pid: dbp.pid}
 	}
 	// set breakpoints on all threads
 	for _, th := range dbp.threads {
 		if th.CurrentBreakpoint.Breakpoint == nil {
 			if err := th.SetCurrentBreakpoint(true); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
-	return nil
+	return trapthread, nil
 }
 
 // Used by Detach
@@ -370,6 +381,18 @@ func (dbp *nativeProcess) detach(kill bool) error {
 func (dbp *nativeProcess) EntryPoint() (uint64, error) {
 	ep, err := C.get_entry_point(C.int(dbp.pid))
 	return uint64(ep), err
+}
+
+func (dbp *nativeProcess) SupportsBPF() bool {
+	return false
+}
+
+func (dbp *nativeProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf.UProbeArgMap) error {
+	panic("not implemented")
+}
+
+func (dbp *nativeProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
+	panic("not implemented")
 }
 
 // Usedy by Detach

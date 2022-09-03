@@ -13,7 +13,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-delve/delve/pkg/logflags"
@@ -28,14 +27,14 @@ type gdbConn struct {
 	inbuf  []byte
 	outbuf bytes.Buffer
 
-	manualStopMutex sync.Mutex
-	running         bool
-	resumeChan      chan<- struct{}
+	running bool
 
 	direction proc.Direction // direction of execution
 
 	packetSize int               // maximum packet size supported by stub
 	regsInfo   []gdbRegisterInfo // list of registers
+
+	workaroundReg *gdbRegisterInfo // used to work-around a register setting bug in debugserver, see use in gdbserver.go
 
 	pid int // cache process id
 
@@ -44,19 +43,14 @@ type gdbConn struct {
 	maxTransmitAttempts   int  // maximum number of transmit or receive attempts when bad checksums are read
 	threadSuffixSupported bool // thread suffix supported by stub
 	isDebugserver         bool // true if the stub is debugserver
+	xcmdok                bool // x command can be used to transfer memory
+	goarch                string
+	goos                  string
+
+	useXcmd bool // forces writeMemory to use the 'X' command
 
 	log *logrus.Entry
 }
-
-const (
-	regnamePC     = "rip"
-	regnameCX     = "rcx"
-	regnameSP     = "rsp"
-	regnameDX     = "rdx"
-	regnameBP     = "rbp"
-	regnameFsBase = "fs_base"
-	regnameGsBase = "gs_base"
-)
 
 var ErrTooManyAttempts = errors.New("too many transmit attempts")
 
@@ -103,7 +97,7 @@ const (
 	qSupportedMultiprocess = "$qSupported:multiprocess+;swbreak+;hwbreak+;no-resumed+;xmlRegisters=i386"
 )
 
-func (conn *gdbConn) handshake() error {
+func (conn *gdbConn) handshake(regnames *gdbRegnames) error {
 	conn.ack = true
 	conn.packetSize = 256
 	conn.rdr = bufio.NewReader(conn.conn)
@@ -149,13 +143,27 @@ func (conn *gdbConn) handshake() error {
 
 	// Attempt to figure out the name of the processor register.
 	// We either need qXfer:features:read (gdbserver/rr) or qRegisterInfo (lldb)
-	if err := conn.readRegisterInfo(); err != nil {
+	regFound := map[string]bool{
+		regnames.PC: false,
+		regnames.SP: false,
+		regnames.BP: false,
+		regnames.CX: false,
+	}
+	if err := conn.readRegisterInfo(regFound); err != nil {
 		if isProtocolErrorUnsupported(err) {
-			if err := conn.readTargetXml(); err != nil {
+			if err := conn.readTargetXml(regFound); err != nil {
 				return err
 			}
 		} else {
 			return err
+		}
+	}
+	for n := range regFound {
+		if n == "" {
+			continue
+		}
+		if !regFound[n] {
+			return fmt.Errorf("could not find %s register", n)
 		}
 	}
 
@@ -171,6 +179,10 @@ func (conn *gdbConn) handshake() error {
 		if gdberr.code != "" {
 			return err
 		}
+	}
+
+	if resp, err := conn.exec([]byte("$x0,0"), "init"); err == nil && string(resp) == "OK" {
+		conn.xcmdok = true
 	}
 
 	return nil
@@ -229,19 +241,29 @@ type gdbRegisterInfo struct {
 	Offset  int
 	Regnum  int    `xml:"regnum,attr"`
 	Group   string `xml:"group,attr"`
+
+	ignoreOnWrite bool
+}
+
+func setRegFound(regFound map[string]bool, name string) {
+	for n := range regFound {
+		if name == n {
+			regFound[n] = true
+		}
+	}
 }
 
 // readTargetXml reads target.xml file from stub using qXfer:features:read,
 // then parses it requesting any additional files.
 // The schema of target.xml is described by:
-//  https://github.com/bminor/binutils-gdb/blob/61baf725eca99af2569262d10aca03dcde2698f6/gdb/features/gdb-target.dtd
-func (conn *gdbConn) readTargetXml() (err error) {
+//
+//	https://github.com/bminor/binutils-gdb/blob/61baf725eca99af2569262d10aca03dcde2698f6/gdb/features/gdb-target.dtd
+func (conn *gdbConn) readTargetXml(regFound map[string]bool) (err error) {
 	conn.regsInfo, err = conn.readAnnex("target.xml")
 	if err != nil {
 		return err
 	}
 	var offset int
-	var pcFound, cxFound, spFound bool
 	regnum := 0
 	for i := range conn.regsInfo {
 		if conn.regsInfo[i].Regnum == 0 {
@@ -251,33 +273,18 @@ func (conn *gdbConn) readTargetXml() (err error) {
 		}
 		conn.regsInfo[i].Offset = offset
 		offset += conn.regsInfo[i].Bitsize / 8
-		switch conn.regsInfo[i].Name {
-		case regnamePC:
-			pcFound = true
-		case regnameCX:
-			cxFound = true
-		case regnameSP:
-			spFound = true
-		}
+
+		setRegFound(regFound, conn.regsInfo[i].Name)
 		regnum++
 	}
-	if !pcFound {
-		return errors.New("could not find RIP register")
-	}
-	if !spFound {
-		return errors.New("could not find RSP register")
-	}
-	if !cxFound {
-		return errors.New("could not find RCX register")
-	}
+
 	return nil
 }
 
 // readRegisterInfo uses qRegisterInfo to read register information (used
 // when qXfer:feature:read is not supported).
-func (conn *gdbConn) readRegisterInfo() (err error) {
+func (conn *gdbConn) readRegisterInfo(regFound map[string]bool) (err error) {
 	regnum := 0
-	var pcFound, cxFound, spFound bool
 	for {
 		conn.outbuf.Reset()
 		fmt.Fprintf(&conn.outbuf, "$qRegisterInfo%x", regnum)
@@ -293,6 +300,7 @@ func (conn *gdbConn) readRegisterInfo() (err error) {
 		var offset int
 		var bitsize int
 		var contained bool
+		var ignoreOnWrite bool
 
 		resp := string(respbytes)
 		for {
@@ -316,6 +324,11 @@ func (conn *gdbConn) readRegisterInfo() (err error) {
 					bitsize, _ = strconv.Atoi(value)
 				case "container-regs":
 					contained = true
+				case "set":
+					if value == "Exception State Registers" || value == "AMX Registers" {
+						// debugserver doesn't like it if we try to write these
+						ignoreOnWrite = true
+					}
 				}
 			}
 
@@ -326,32 +339,18 @@ func (conn *gdbConn) readRegisterInfo() (err error) {
 		}
 
 		if contained {
+			if regname == "xmm0" {
+				conn.workaroundReg = &gdbRegisterInfo{Regnum: regnum, Name: regname, Bitsize: bitsize, Offset: offset, ignoreOnWrite: ignoreOnWrite}
+			}
 			regnum++
 			continue
 		}
 
-		switch regname {
-		case regnamePC:
-			pcFound = true
-		case regnameCX:
-			cxFound = true
-		case regnameSP:
-			spFound = true
-		}
+		setRegFound(regFound, regname)
 
-		conn.regsInfo = append(conn.regsInfo, gdbRegisterInfo{Regnum: regnum, Name: regname, Bitsize: bitsize, Offset: offset})
+		conn.regsInfo = append(conn.regsInfo, gdbRegisterInfo{Regnum: regnum, Name: regname, Bitsize: bitsize, Offset: offset, ignoreOnWrite: ignoreOnWrite})
 
 		regnum++
-	}
-
-	if !pcFound {
-		return errors.New("could not find RIP register")
-	}
-	if !spFound {
-		return errors.New("could not find RSP register")
-	}
-	if !cxFound {
-		return errors.New("could not find RCX register")
 	}
 
 	return nil
@@ -412,18 +411,39 @@ func (conn *gdbConn) qXfer(kind, annex string, binary bool) ([]byte, error) {
 	return out, nil
 }
 
-// setBreakpoint executes a 'Z' (insert breakpoint) command of type '0' and kind '1'
-func (conn *gdbConn) setBreakpoint(addr uint64) error {
+// qXferWrite executes a 'qXfer' write with the specified kind and annex.
+func (conn *gdbConn) qXferWrite(kind, annex string) error {
 	conn.outbuf.Reset()
-	fmt.Fprintf(&conn.outbuf, "$Z0,%x,1", addr)
+	fmt.Fprintf(&conn.outbuf, "$qXfer:%s:write:%s:0:", kind, annex)
+	//TODO(aarzilli): if we ever actually need to write something with qXfer,
+	//this will need to be implemented properly. At the moment it is only used
+	//for a fake write to the siginfo kind, to end a diversion in 'rr'.
+	_, err := conn.exec(conn.outbuf.Bytes(), "qXfer")
+	return err
+}
+
+type breakpointType uint8
+
+const (
+	swBreakpoint     breakpointType = 0
+	hwBreakpoint     breakpointType = 1
+	writeWatchpoint  breakpointType = 2
+	readWatchpoint   breakpointType = 3
+	accessWatchpoint breakpointType = 4
+)
+
+// setBreakpoint executes a 'Z' (insert breakpoint) command of type '0' and kind '1' or '4'
+func (conn *gdbConn) setBreakpoint(addr uint64, typ breakpointType, kind int) error {
+	conn.outbuf.Reset()
+	fmt.Fprintf(&conn.outbuf, "$Z%d,%x,%d", typ, addr, kind)
 	_, err := conn.exec(conn.outbuf.Bytes(), "set breakpoint")
 	return err
 }
 
-// clearBreakpoint executes a 'z' (remove breakpoint) command of type '0' and kind '1'
-func (conn *gdbConn) clearBreakpoint(addr uint64) error {
+// clearBreakpoint executes a 'z' (remove breakpoint) command of type '0' and kind '1' or '4'
+func (conn *gdbConn) clearBreakpoint(addr uint64, typ breakpointType, kind int) error {
 	conn.outbuf.Reset()
-	fmt.Fprintf(&conn.outbuf, "$z0,%x,1", addr)
+	fmt.Fprintf(&conn.outbuf, "$z%d,%x,%d", typ, addr, kind)
 	_, err := conn.exec(conn.outbuf.Bytes(), "clear breakpoint")
 	return err
 }
@@ -545,7 +565,7 @@ func (conn *gdbConn) writeRegister(threadID string, regnum int, data []byte) err
 // resume each thread. If a thread has sig == 0 the 'c' action will be used,
 // otherwise the 'C' action will be used and the value of sig will be passed
 // to it.
-func (conn *gdbConn) resume(threads map[int]*gdbThread, tu *threadUpdater) (string, uint8, error) {
+func (conn *gdbConn) resume(cctx *proc.ContinueOnceContext, threads map[int]*gdbThread, tu *threadUpdater) (stopPacket, error) {
 	if conn.direction == proc.Forward {
 		conn.outbuf.Reset()
 		fmt.Fprintf(&conn.outbuf, "$vCont")
@@ -557,32 +577,33 @@ func (conn *gdbConn) resume(threads map[int]*gdbThread, tu *threadUpdater) (stri
 		fmt.Fprintf(&conn.outbuf, ";c")
 	} else {
 		if err := conn.selectThread('c', "p-1.-1", "resume"); err != nil {
-			return "", 0, err
+			return stopPacket{}, err
 		}
 		conn.outbuf.Reset()
 		fmt.Fprint(&conn.outbuf, "$bc")
 	}
-	conn.manualStopMutex.Lock()
+	cctx.StopMu.Lock()
 	if err := conn.send(conn.outbuf.Bytes()); err != nil {
-		conn.manualStopMutex.Unlock()
-		return "", 0, err
+		cctx.StopMu.Unlock()
+		return stopPacket{}, err
 	}
 	conn.running = true
-	conn.manualStopMutex.Unlock()
+	cctx.StopMu.Unlock()
 	defer func() {
-		conn.manualStopMutex.Lock()
+		cctx.StopMu.Lock()
 		conn.running = false
-		conn.manualStopMutex.Unlock()
+		cctx.StopMu.Unlock()
 	}()
-	if conn.resumeChan != nil {
-		close(conn.resumeChan)
-		conn.resumeChan = nil
+	if cctx.ResumeChan != nil {
+		close(cctx.ResumeChan)
+		cctx.ResumeChan = nil
 	}
 	return conn.waitForvContStop("resume", "-1", tu)
 }
 
 // step executes a 'vCont' command on the specified thread with 's' action.
-func (conn *gdbConn) step(threadID string, tu *threadUpdater, ignoreFaultSignal bool) error {
+func (conn *gdbConn) step(th *gdbThread, tu *threadUpdater, ignoreFaultSignal bool) error {
+	threadID := th.strID
 	if conn.direction != proc.Forward {
 		if err := conn.selectThread('c', threadID, "step"); err != nil {
 			return err
@@ -592,9 +613,20 @@ func (conn *gdbConn) step(threadID string, tu *threadUpdater, ignoreFaultSignal 
 		if err := conn.send(conn.outbuf.Bytes()); err != nil {
 			return err
 		}
-		_, _, err := conn.waitForvContStop("singlestep", threadID, tu)
+		_, err := conn.waitForvContStop("singlestep", threadID, tu)
 		return err
 	}
+
+	var _SIGBUS uint8
+	switch conn.goos {
+	case "linux":
+		_SIGBUS = 0x7
+	case "darwin":
+		_SIGBUS = 0xa
+	default:
+		panic(fmt.Errorf("unknown GOOS %s", conn.goos))
+	}
+
 	var sig uint8 = 0
 	for {
 		conn.outbuf.Reset()
@@ -609,8 +641,8 @@ func (conn *gdbConn) step(threadID string, tu *threadUpdater, ignoreFaultSignal 
 		if tu != nil {
 			tu.Reset()
 		}
-		var err error
-		_, sig, err = conn.waitForvContStop("singlestep", threadID, tu)
+		sp, err := conn.waitForvContStop("singlestep", threadID, tu)
+		sig = sp.sig
 		if err != nil {
 			return err
 		}
@@ -619,6 +651,8 @@ func (conn *gdbConn) step(threadID string, tu *threadUpdater, ignoreFaultSignal 
 			if ignoreFaultSignal { // we attempting to read the TLS, a fault here should be ignored
 				return nil
 			}
+		case _SIGILL, _SIGBUS, _SIGFPE:
+			// propagate these signals to inferior immediately
 		case interruptSignal, breakpointSignal, stopSignal:
 			return nil
 		case childSignal: // stop on debugserver but SIGCHLD on lldb-server/linux
@@ -626,15 +660,21 @@ func (conn *gdbConn) step(threadID string, tu *threadUpdater, ignoreFaultSignal 
 				return nil
 			}
 		case debugServerTargetExcBadAccess, debugServerTargetExcBadInstruction, debugServerTargetExcArithmetic, debugServerTargetExcEmulation, debugServerTargetExcSoftware, debugServerTargetExcBreakpoint:
-			return nil
+			if ignoreFaultSignal {
+				return nil
+			}
+			return machTargetExcToError(sig)
+		default:
+			// delay propagation of any other signal to until after the stepping is done
+			th.sig = sig
+			sig = 0
 		}
-		// any other signal is propagated to the inferior
 	}
 }
 
-var threadBlockedError = errors.New("thread blocked")
+var errThreadBlocked = errors.New("thread blocked")
 
-func (conn *gdbConn) waitForvContStop(context string, threadID string, tu *threadUpdater) (string, uint8, error) {
+func (conn *gdbConn) waitForvContStop(context, threadID string, tu *threadUpdater) (stopPacket, error) {
 	count := 0
 	failed := false
 	for {
@@ -655,23 +695,36 @@ func (conn *gdbConn) waitForvContStop(context string, threadID string, tu *threa
 			}
 			count++
 		} else if failed {
-			return "", 0, threadBlockedError
+			return stopPacket{}, errThreadBlocked
 		} else if err != nil {
-			return "", 0, err
+			return stopPacket{}, err
 		} else {
 			repeat, sp, err := conn.parseStopPacket(resp, threadID, tu)
 			if !repeat {
-				return sp.threadID, sp.sig, err
+				return sp, err
 			}
 		}
 	}
 }
 
 type stopPacket struct {
-	threadID string
-	sig      uint8
-	reason   string
+	threadID  string
+	sig       uint8
+	reason    string
+	watchAddr uint64
 }
+
+// Mach exception codes used to decode metype/medata keys in stop packets (necessary to support watchpoints with debugserver).
+// See:
+//
+//	https://opensource.apple.com/source/xnu/xnu-4570.1.46/osfmk/mach/exception_types.h.auto.html
+//	https://opensource.apple.com/source/xnu/xnu-4570.1.46/osfmk/mach/i386/exception.h.auto.html
+//	https://opensource.apple.com/source/xnu/xnu-4570.1.46/osfmk/mach/arm/exception.h.auto.html
+const (
+	_EXC_BREAKPOINT   = 6     // mach exception type for hardware breakpoints
+	_EXC_I386_SGL     = 1     // mach exception code for single step on x86, for some reason this is also used for watchpoints
+	_EXC_ARM_DA_DEBUG = 0x102 // mach exception code for debug fault on arm/arm64
+)
 
 // executes 'vCont' (continue/step) command
 func (conn *gdbConn) parseStopPacket(resp []byte, threadID string, tu *threadUpdater) (repeat bool, sp stopPacket, err error) {
@@ -690,6 +743,9 @@ func (conn *gdbConn) parseStopPacket(resp []byte, threadID string, tu *threadUpd
 		if logflags.GdbWire() && gdbWireFullStopPacket {
 			conn.log.Debugf("full stop packet: %s", string(resp))
 		}
+
+		var metype int
+		var medata = make([]uint64, 0, 10)
 
 		buf := resp[3:]
 		for buf != nil {
@@ -720,6 +776,32 @@ func (conn *gdbConn) parseStopPacket(resp []byte, threadID string, tu *threadUpd
 				}
 			case "reason":
 				sp.reason = string(value)
+			case "watch", "awatch", "rwatch":
+				sp.watchAddr, err = strconv.ParseUint(string(value), 16, 64)
+				if err != nil {
+					return false, stopPacket{}, fmt.Errorf("malformed stop packet: %s (wrong watch address)", string(resp))
+				}
+			case "metype":
+				// mach exception type (debugserver extension)
+				metype, _ = strconv.Atoi(string(value))
+			case "medata":
+				// mach exception data (debugserver extension)
+				d, _ := strconv.ParseUint(string(value), 16, 64)
+				medata = append(medata, d)
+			}
+		}
+
+		// Debugserver does not report watchpoint stops in the standard way preferring
+		// instead the semi-undocumented metype/medata keys.
+		// These values also have different meanings depending on the CPU architecture.
+		switch conn.goarch {
+		case "amd64":
+			if metype == _EXC_BREAKPOINT && len(medata) >= 2 && medata[0] == _EXC_I386_SGL {
+				sp.watchAddr = medata[1] // this should be zero if this is really a single step stop and non-zero for watchpoints
+			}
+		case "arm64":
+			if metype == _EXC_BREAKPOINT && len(medata) >= 2 && medata[0] == _EXC_ARM_DA_DEBUG {
+				sp.watchAddr = medata[1]
 			}
 		}
 
@@ -879,8 +961,15 @@ func (conn *gdbConn) appendThreadSelector(threadID string) {
 	fmt.Fprintf(&conn.outbuf, ";thread:%s;", threadID)
 }
 
+func (conn *gdbConn) readMemory(data []byte, addr uint64) error {
+	if conn.xcmdok && len(data) > conn.packetSize {
+		return conn.readMemoryBinary(data, addr)
+	}
+	return conn.readMemoryHex(data, addr)
+}
+
 // executes 'm' (read memory) command
-func (conn *gdbConn) readMemory(data []byte, addr uintptr) error {
+func (conn *gdbConn) readMemoryHex(data []byte, addr uint64) error {
 	size := len(data)
 	data = data[:0]
 
@@ -894,7 +983,7 @@ func (conn *gdbConn) readMemory(data []byte, addr uintptr) error {
 		}
 		size = size - sz
 
-		fmt.Fprintf(&conn.outbuf, "$m%x,%x", addr+uintptr(len(data)), sz)
+		fmt.Fprintf(&conn.outbuf, "$m%x,%x", addr+uint64(len(data)), sz)
 		resp, err := conn.exec(conn.outbuf.Bytes(), "memory read")
 		if err != nil {
 			return err
@@ -908,14 +997,45 @@ func (conn *gdbConn) readMemory(data []byte, addr uintptr) error {
 	return nil
 }
 
+// executes 'x' (binary read memory) command
+func (conn *gdbConn) readMemoryBinary(data []byte, addr uint64) error {
+	size := len(data)
+	data = data[:0]
+
+	for len(data) < size {
+		conn.outbuf.Reset()
+
+		sz := size - len(data)
+
+		fmt.Fprintf(&conn.outbuf, "$x%x,%x", addr+uint64(len(data)), sz)
+		if err := conn.send(conn.outbuf.Bytes()); err != nil {
+			return err
+		}
+		resp, err := conn.recv(conn.outbuf.Bytes(), "binary memory read", true)
+		if err != nil {
+			return err
+		}
+		data = append(data, resp...)
+	}
+	return nil
+}
+
 func writeAsciiBytes(w io.Writer, data []byte) {
 	for _, b := range data {
 		fmt.Fprintf(w, "%02x", b)
 	}
 }
 
+// writeMemory writes memory using either 'M' or 'X'
+func (conn *gdbConn) writeMemory(addr uint64, data []byte) (written int, err error) {
+	if conn.useXcmd {
+		return conn.writeMemoryBinary(addr, data)
+	}
+	return conn.writeMemoryHex(addr, data)
+}
+
 // executes 'M' (write memory) command
-func (conn *gdbConn) writeMemory(addr uintptr, data []byte) (written int, err error) {
+func (conn *gdbConn) writeMemoryHex(addr uint64, data []byte) (written int, err error) {
 	if len(data) == 0 {
 		// LLDB can't parse requests for 0-length writes and hangs if we emit them
 		return 0, nil
@@ -925,6 +1045,27 @@ func (conn *gdbConn) writeMemory(addr uintptr, data []byte) (written int, err er
 	fmt.Fprintf(&conn.outbuf, "$M%x,%x:", addr, len(data))
 
 	writeAsciiBytes(&conn.outbuf, data)
+
+	_, err = conn.exec(conn.outbuf.Bytes(), "memory write")
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+func (conn *gdbConn) writeMemoryBinary(addr uint64, data []byte) (written int, err error) {
+	conn.outbuf.Reset()
+	fmt.Fprintf(&conn.outbuf, "$X%x,%x:", addr, len(data))
+
+	for _, b := range data {
+		switch b {
+		case '#', '$', '}':
+			conn.outbuf.WriteByte('}')
+			conn.outbuf.WriteByte(b ^ escapeXor)
+		default:
+			conn.outbuf.WriteByte(b)
+		}
+	}
 
 	_, err = conn.exec(conn.outbuf.Bytes(), "memory write")
 	if err != nil {
@@ -945,18 +1086,48 @@ func (conn *gdbConn) allocMemory(sz uint64) (uint64, error) {
 
 // threadStopInfo executes a 'qThreadStopInfo' and returns the reason the
 // thread stopped.
-func (conn *gdbConn) threadStopInfo(threadID string) (sig uint8, reason string, err error) {
+func (conn *gdbConn) threadStopInfo(threadID string) (sp stopPacket, err error) {
 	conn.outbuf.Reset()
 	fmt.Fprintf(&conn.outbuf, "$qThreadStopInfo%s", threadID)
 	resp, err := conn.exec(conn.outbuf.Bytes(), "thread stop info")
 	if err != nil {
-		return 0, "", err
+		return stopPacket{}, err
 	}
-	_, sp, err := conn.parseStopPacket(resp, "", nil)
+	_, sp, err = conn.parseStopPacket(resp, "", nil)
 	if err != nil {
-		return 0, "", err
+		return stopPacket{}, err
 	}
-	return sp.sig, sp.reason, nil
+	if sp.threadID != threadID {
+		// When we send a ^C (manual stop request) and the process is close to
+		// stopping anyway, sometimes, debugserver will send back two stop
+		// packets. We need to ignore this spurious stop packet. Because the first
+		// thing we do after the stop is updateThreadList, which calls this
+		// function, this is relatively painless. We simply need to check that the
+		// stop packet we receive is for the thread we requested, if it isn't we
+		// can assume it is the spurious extra stop packet and simply ignore it.
+		// An example of a problematic interaction is in the commit message for
+		// this change.
+		// See https://github.com/go-delve/delve/issues/3013.
+
+		conn.conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+		resp, err = conn.recv(conn.outbuf.Bytes(), "thread stop info", false)
+		conn.conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			if neterr, isneterr := err.(net.Error); isneterr && neterr.Timeout() {
+				return stopPacket{}, fmt.Errorf("qThreadStopInfo mismatch, requested %s got %s", sp.threadID, threadID)
+			}
+			return stopPacket{}, err
+		}
+		_, sp, err = conn.parseStopPacket(resp, "", nil)
+		if err != nil {
+			return stopPacket{}, err
+		}
+		if sp.threadID != threadID {
+			return stopPacket{}, fmt.Errorf("qThreadStopInfo mismatch, requested %s got %s", sp.threadID, threadID)
+		}
+	}
+
+	return sp, nil
 }
 
 // restart executes a 'vRun' command.
@@ -999,8 +1170,9 @@ type imageList struct {
 }
 
 type imageDescription struct {
-	Pathname   string     `json:"pathname"`
-	MachHeader machHeader `json:"mach_header"`
+	LoadAddress uint64     `json:"load_address"`
+	Pathname    string     `json:"pathname"`
+	MachHeader  machHeader `json:"mach_header"`
 }
 
 type machHeader struct {
@@ -1023,9 +1195,91 @@ func (conn *gdbConn) getLoadedDynamicLibraries() ([]imageDescription, error) {
 	return images.Images, err
 }
 
+type memoryRegionInfo struct {
+	start       uint64
+	size        uint64
+	permissions string
+	name        string
+}
+
+func decodeHexString(in []byte) (string, bool) {
+	out := make([]byte, 0, len(in)/2)
+	for i := 0; i < len(in); i += 2 {
+		v, err := strconv.ParseUint(string(in[i:i+2]), 16, 8)
+		if err != nil {
+			return "", false
+		}
+		out = append(out, byte(v))
+	}
+	return string(out), true
+}
+
+func (conn *gdbConn) memoryRegionInfo(addr uint64) (*memoryRegionInfo, error) {
+	conn.outbuf.Reset()
+	fmt.Fprintf(&conn.outbuf, "$qMemoryRegionInfo:%x", addr)
+	resp, err := conn.exec(conn.outbuf.Bytes(), "qMemoryRegionInfo")
+	if err != nil {
+		return nil, err
+	}
+
+	mri := &memoryRegionInfo{}
+
+	buf := resp
+	for len(buf) > 0 {
+		colon := bytes.Index(buf, []byte{':'})
+		if colon < 0 {
+			break
+		}
+		key := buf[:colon]
+		buf = buf[colon+1:]
+
+		semicolon := bytes.Index(buf, []byte{';'})
+		var value []byte
+		if semicolon < 0 {
+			value = buf
+			buf = nil
+		} else {
+			value = buf[:semicolon]
+			buf = buf[semicolon+1:]
+		}
+
+		switch string(key) {
+		case "start":
+			start, err := strconv.ParseUint(string(value), 16, 64)
+			if err != nil {
+				return nil, fmt.Errorf("malformed qMemoryRegionInfo response packet (start): %v in %s", err, string(resp))
+			}
+			mri.start = start
+		case "size":
+			size, err := strconv.ParseUint(string(value), 16, 64)
+			if err != nil {
+				return nil, fmt.Errorf("malformed qMemoryRegionInfo response packet (size): %v in %s", err, string(resp))
+			}
+			mri.size = size
+		case "permissions":
+			mri.permissions = string(value)
+		case "name":
+			namestr, ok := decodeHexString(value)
+			if !ok {
+				return nil, fmt.Errorf("malformed qMemoryRegionInfo response packet (name): %s", string(resp))
+			}
+			mri.name = namestr
+		case "error":
+			errstr, ok := decodeHexString(value)
+			if !ok {
+				return nil, fmt.Errorf("malformed qMemoryRegionInfo response packet (error): %s", string(resp))
+			}
+			return nil, fmt.Errorf("qMemoryRegionInfo error: %s", errstr)
+		}
+	}
+
+	return mri, nil
+}
+
 // exec executes a message to the stub and reads a response.
 // The details of the wire protocol are described here:
-//  https://sourceware.org/gdb/onlinedocs/gdb/Overview.html#Overview
+//
+//	https://sourceware.org/gdb/onlinedocs/gdb/Overview.html#Overview
 func (conn *gdbConn) exec(cmd []byte, context string) ([]byte, error) {
 	if err := conn.send(cmd); err != nil {
 		return nil, err
@@ -1084,14 +1338,14 @@ func (conn *gdbConn) recv(cmd []byte, context string, binary bool) (resp []byte,
 		}
 
 		// read checksum
-		_, err = conn.rdr.Read(conn.inbuf[:2])
+		_, err = io.ReadFull(conn.rdr, conn.inbuf[:2])
 		if err != nil {
 			return nil, err
 		}
 		if logflags.GdbWire() {
 			out := resp
 			partial := false
-			if idx := bytes.Index(out, []byte{'\n'}); idx >= 0 {
+			if idx := bytes.Index(out, []byte{'\n'}); idx >= 0 && !binary {
 				out = resp[:idx]
 				partial = true
 			}
@@ -1100,9 +1354,17 @@ func (conn *gdbConn) recv(cmd []byte, context string, binary bool) (resp []byte,
 				partial = true
 			}
 			if !partial {
-				conn.log.Debugf("-> %s%s", string(resp), string(conn.inbuf[:2]))
+				if binary {
+					conn.log.Debugf("-> %q%s", string(resp), string(conn.inbuf[:2]))
+				} else {
+					conn.log.Debugf("-> %s%s", string(resp), string(conn.inbuf[:2]))
+				}
 			} else {
-				conn.log.Debugf("-> %s...", string(out))
+				if binary {
+					conn.log.Debugf("-> %q...", string(out))
+				} else {
+					conn.log.Debugf("-> %s...", string(out))
+				}
 			}
 		}
 
@@ -1136,7 +1398,7 @@ func (conn *gdbConn) recv(cmd []byte, context string, binary bool) (resp []byte,
 		conn.inbuf, resp = wiredecode(resp, conn.inbuf)
 	}
 
-	if len(resp) == 0 || resp[0] == 'E' {
+	if len(resp) == 0 || (resp[0] == 'E' && !binary) || (resp[0] == 'E' && len(resp) == 3) {
 		cmdstr := ""
 		if cmd != nil {
 			cmdstr = string(cmd)
@@ -1259,7 +1521,10 @@ func checksumok(packet, checksumBuf []byte) bool {
 	if err != nil {
 		return false
 	}
-	return sum == uint8(tgt)
+
+	tgt8 := uint8(tgt)
+
+	return sum == tgt8
 }
 
 func checksum(packet []byte) (sum uint8) {

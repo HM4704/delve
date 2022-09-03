@@ -2,7 +2,6 @@ package gdbserial
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -12,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"unicode"
 
+	"github.com/go-delve/delve/pkg/config"
 	"github.com/go-delve/delve/pkg/proc"
 )
 
@@ -22,7 +21,7 @@ import (
 // stop function which will prematurely terminate the recording of the
 // program.
 func RecordAsync(cmd []string, wd string, quiet bool, redirects [3]string) (run func() (string, error), stop func() error, err error) {
-	if err := checkRRAvailabe(); err != nil {
+	if err := checkRRAvailable(); err != nil {
 		return nil, nil, err
 	}
 
@@ -126,7 +125,7 @@ func Record(cmd []string, wd string, quiet bool, redirects [3]string) (tracedir 
 // Replay starts an instance of rr in replay mode, with the specified trace
 // directory, and connects to it.
 func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string) (*proc.Target, error) {
-	if err := checkRRAvailabe(); err != nil {
+	if err := checkRRAvailable(); err != nil {
 		return nil, err
 	}
 
@@ -154,6 +153,7 @@ func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string)
 
 	p := newProcess(rrcmd.Process)
 	p.tracedir = tracedir
+	p.conn.useXcmd = true // 'rr' does not support the 'M' command which is what we would usually use to write memory, this is only important during function calls, in any other situation writing memory will fail anyway.
 	if deleteOnDetach {
 		p.onDetach = func() {
 			safeRemoveAll(p.tracedir)
@@ -178,7 +178,7 @@ func (err ErrPerfEventParanoid) Error() string {
 	return fmt.Sprintf("rr needs /proc/sys/kernel/perf_event_paranoid <= 1, but it is %d", err.actual)
 }
 
-func checkRRAvailabe() error {
+func checkRRAvailable() error {
 	if _, err := exec.LookPath("rr"); err != nil {
 		return &ErrBackendUnavailable{}
 	}
@@ -207,8 +207,10 @@ const (
 	targetCmd          = "target extended-remote "
 )
 
-func rrStderrParser(stderr io.Reader, initch chan<- rrInit, quiet bool) {
+func rrStderrParser(stderr io.ReadCloser, initch chan<- rrInit, quiet bool) {
 	rd := bufio.NewReader(stderr)
+	defer stderr.Close()
+
 	for {
 		line, err := rd.ReadString('\n')
 		if err != nil {
@@ -245,7 +247,7 @@ func (err *ErrMalformedRRGdbCommand) Error() string {
 
 func rrParseGdbCommand(line string) rrInit {
 	port := ""
-	fields := splitQuotedFields(line)
+	fields := config.SplitQuotedFields(line, '\'')
 	for i := 0; i < len(fields); i++ {
 		switch fields[i] {
 		case "-ex":
@@ -274,63 +276,6 @@ func rrParseGdbCommand(line string) rrInit {
 	exe := fields[len(fields)-1]
 
 	return rrInit{port: port, exe: exe}
-}
-
-// Like strings.Fields but ignores spaces inside areas surrounded
-// by single quotes.
-// To specify a single quote use backslash to escape it: '\''
-func splitQuotedFields(in string) []string {
-	type stateEnum int
-	const (
-		inSpace stateEnum = iota
-		inField
-		inQuote
-		inQuoteEscaped
-	)
-	state := inSpace
-	r := []string{}
-	var buf bytes.Buffer
-
-	for _, ch := range in {
-		switch state {
-		case inSpace:
-			if ch == '\'' {
-				state = inQuote
-			} else if !unicode.IsSpace(ch) {
-				buf.WriteRune(ch)
-				state = inField
-			}
-
-		case inField:
-			if ch == '\'' {
-				state = inQuote
-			} else if unicode.IsSpace(ch) {
-				r = append(r, buf.String())
-				buf.Reset()
-			} else {
-				buf.WriteRune(ch)
-			}
-
-		case inQuote:
-			if ch == '\'' {
-				state = inField
-			} else if ch == '\\' {
-				state = inQuoteEscaped
-			} else {
-				buf.WriteRune(ch)
-			}
-
-		case inQuoteEscaped:
-			buf.WriteRune(ch)
-			state = inQuote
-		}
-	}
-
-	if buf.Len() != 0 {
-		r = append(r, buf.String())
-	}
-
-	return r
 }
 
 // RecordAndReplay acts like calling Record and then Replay.

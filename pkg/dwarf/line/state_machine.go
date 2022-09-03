@@ -49,14 +49,6 @@ type StateMachine struct {
 	ptrSize     int
 }
 
-type opcodeKind uint8
-
-const (
-	specialOpcode opcodeKind = iota
-	standardOpcode
-	extendedOpcode
-)
-
 type opcodefn func(*StateMachine, *bytes.Buffer)
 
 // Special opcodes
@@ -111,9 +103,13 @@ func newStateMachine(dbl *DebugLineInfo, instructions []byte, ptrSize int) *Stat
 	for op := range standardopcodes {
 		opcodes[op] = standardopcodes[op]
 	}
+	var file string
+	if len(dbl.FileNames) > 0 {
+		file = dbl.FileNames[0].Path
+	}
 	sm := &StateMachine{
 		dbl:         dbl,
-		file:        dbl.FileNames[0].Path,
+		file:        file,
 		line:        1,
 		buf:         bytes.NewBuffer(instructions),
 		opcodes:     opcodes,
@@ -152,15 +148,15 @@ func (lineInfo *DebugLineInfo) AllPCsForFileLines(f string, m map[int][]uint64) 
 			}
 		}
 	}
-	return
 }
 
-var NoSourceError = errors.New("no source available")
+var ErrNoSource = errors.New("no source available")
 
-// AllPCsBetween returns all PC addresses between begin and end (including both begin and end) that have the is_stmt flag set and do not belong to excludeFile:excludeLine
+// AllPCsBetween returns all PC addresses between begin and end (including both begin and end)
+// that have the is_stmt flag set and do not belong to excludeFile:excludeLine.
 func (lineInfo *DebugLineInfo) AllPCsBetween(begin, end uint64, excludeFile string, excludeLine int) ([]uint64, error) {
 	if lineInfo == nil {
-		return nil, NoSourceError
+		return nil, ErrNoSource
 	}
 
 	var (
@@ -182,7 +178,7 @@ func (lineInfo *DebugLineInfo) AllPCsBetween(begin, end uint64, excludeFile stri
 		if (sm.address > end) && (end >= sm.lastAddress) {
 			break
 		}
-		if sm.address >= begin && sm.address <= end && sm.address > lastaddr && sm.isStmt && ((sm.file != excludeFile) || (sm.line != excludeLine)) {
+		if sm.address >= begin && sm.address <= end && sm.address > lastaddr && sm.isStmt && !sm.endSeq && ((sm.file != excludeFile) || (sm.line != excludeLine)) {
 			lastaddr = sm.address
 			pcs = append(pcs, sm.address)
 		}
@@ -235,7 +231,7 @@ func (lineInfo *DebugLineInfo) stateMachineFor(basePC, pc uint64) *StateMachine 
 		sm = newStateMachine(lineInfo, lineInfo.Instructions, lineInfo.ptrSize)
 	} else {
 		// Try to use the last state machine that we used for this function, if
-		// there isn't one or it's already past pc try to clone the cached state
+		// there isn't one, or it's already past pc try to clone the cached state
 		// machine stopped at the entry point of the function.
 		// As a last resort start from the start of the debug_line section.
 		sm = lineInfo.lastMachineCache[basePC]
@@ -281,76 +277,35 @@ func (sm *StateMachine) PCToLine(pc uint64) (string, int, bool) {
 	return "", 0, false
 }
 
-// LineToPC returns the first PC address associated with filename:lineno.
-func (lineInfo *DebugLineInfo) LineToPC(filename string, lineno int) uint64 {
+// PCStmt is a PC address with its is_stmt flag
+type PCStmt struct {
+	PC   uint64
+	Stmt bool
+}
+
+// LineToPCs returns all PCs associated with filename:lineno
+func (lineInfo *DebugLineInfo) LineToPCs(filename string, lineno int) []PCStmt {
 	if lineInfo == nil {
-		return 0
+		return nil
 	}
 
 	sm := newStateMachine(lineInfo, lineInfo.Instructions, lineInfo.ptrSize)
 
-	// if no instruction marked is_stmt is found fallback to the first
-	// instruction assigned to the filename:line.
-	var fallbackPC uint64
+	pcstmts := []PCStmt{}
 
 	for {
 		if err := sm.next(); err != nil {
 			if lineInfo.Logf != nil && err != io.EOF {
-				lineInfo.Logf("LineToPC error: %v", err)
+				lineInfo.Logf("LineToPCs error: %v", err)
 			}
 			break
 		}
 		if sm.line == lineno && sm.file == filename && sm.valid {
-			if sm.isStmt {
-				return sm.address
-			} else if fallbackPC == 0 {
-				fallbackPC = sm.address
-			}
+			pcstmts = append(pcstmts, PCStmt{sm.address, sm.isStmt})
 		}
 	}
-	return fallbackPC
-}
 
-// LineToPCIn returns the first PC for filename:lineno in the interval [startPC, endPC).
-// This function is used to find the instruction corresponding to
-// filename:lineno for a function that has been inlined.
-// basePC will be used for caching, it's normally the entry point for the
-// function containing pc.
-func (lineInfo *DebugLineInfo) LineToPCIn(filename string, lineno int, basePC, startPC, endPC uint64) uint64 {
-	if lineInfo == nil {
-		return 0
-	}
-	if basePC > startPC {
-		panic(fmt.Errorf("basePC after startPC %#x %#x", basePC, startPC))
-	}
-
-	sm := lineInfo.stateMachineFor(basePC, startPC)
-
-	var fallbackPC uint64
-
-	for {
-		if sm.valid && sm.started {
-			if sm.address >= endPC {
-				break
-			}
-			if sm.line == lineno && sm.file == filename && sm.address >= startPC {
-				if sm.isStmt {
-					return sm.address
-				} else {
-					fallbackPC = sm.address
-				}
-			}
-		}
-		if err := sm.next(); err != nil {
-			if lineInfo.Logf != nil && err != io.EOF {
-				lineInfo.Logf("LineToPC error: %v", err)
-			}
-			break
-		}
-
-	}
-
-	return fallbackPC
+	return pcstmts
 }
 
 // PrologueEndPC returns the first PC address marked as prologue_end in the half open interval [start, end)
@@ -543,7 +498,7 @@ func fixedadvancepc(sm *StateMachine, buf *bytes.Buffer) {
 
 func endsequence(sm *StateMachine, buf *bytes.Buffer) {
 	sm.endSeq = true
-	sm.valid = true
+	sm.valid = sm.dbl.endSeqIsValid
 }
 
 func setaddress(sm *StateMachine, buf *bytes.Buffer) {
@@ -559,8 +514,9 @@ func setdiscriminator(sm *StateMachine, buf *bytes.Buffer) {
 }
 
 func definefile(sm *StateMachine, buf *bytes.Buffer) {
-	entry := readFileEntry(sm.dbl, sm.buf, false)
-	sm.definedFiles = append(sm.definedFiles, entry)
+	if entry := readFileEntry(sm.dbl, sm.buf, false); entry != nil {
+		sm.definedFiles = append(sm.definedFiles, entry)
+	}
 }
 
 func prologueend(sm *StateMachine, buf *bytes.Buffer) {

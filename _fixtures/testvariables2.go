@@ -5,8 +5,11 @@ import (
 	"go/constant"
 	"math"
 	"runtime"
+	"time"
 	"unsafe"
 )
+
+type Byte byte
 
 type astruct struct {
 	A int
@@ -106,12 +109,45 @@ type List struct {
 	Next *List
 }
 
+type T struct {
+	F string
+}
+
+type W1 struct {
+	T
+}
+
+func (*W1) M() {}
+
+type I interface{ M() }
+
+type W2 struct {
+	W1
+	T
+}
+
+type W3 struct {
+	I
+	T
+}
+
+type W4 struct {
+	I
+}
+
+type W5 struct {
+	*W5
+}
+
+var _ I = (*W2)(nil)
+
 func main() {
 	i1 := 1
 	i2 := 2
 	f1 := 3.0
 	i3 := 3
 	p1 := &i1
+	pp1 := &p1
 	s1 := []string{"one", "two", "three", "four", "five"}
 	s3 := make([]int, 0, 6)
 	a0 := [0]int{}
@@ -282,22 +318,28 @@ func main() {
 	zsvmap := map[string]struct{}{"testkey": struct{}{}}
 	var tm truncatedMap
 	tm.v = []map[string]astruct{m1}
+	var rettm = func() truncatedMap { return tm }
 
 	emptyslice := []string{}
 	emptymap := make(map[string]string)
 
 	byteslice := []byte{116, 195, 168, 115, 116}
+	bytestypeslice := []Byte{116, 195, 168, 115, 116}
 	runeslice := []rune{116, 232, 115, 116}
 
 	bytearray := [5]byte{116, 195, 168, 115, 116}
+	bytetypearray := [5]Byte{116, 195, 168, 115, 116}
 	runearray := [4]rune{116, 232, 115, 116}
 
 	longstr := "very long string 0123456789a0123456789b0123456789c0123456789d0123456789e0123456789f0123456789g012345678h90123456789i0123456789j0123456789"
-
+	m5 := map[C]int{{longstr}: 1}
+	m6 := map[string]int{longstr: 123}
+	m7 := map[C]C{{longstr}: {"hello"}}
+	cl := C{s: longstr}
 	var nilstruct *astruct = nil
 
+	val := A{val: 1} // val vs val.val
 	var as2 astruct
-
 	s4 := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 0}
 
 	var iface2map interface{} = map[string]interface{}{
@@ -312,12 +354,25 @@ func main() {
 	ll := &List{0, &List{1, &List{2, &List{3, &List{4, nil}}}}}
 	unread := (*int)(unsafe.Pointer(uintptr(12345)))
 
+	w2 := &W2{W1{T{"T-inside-W1"}}, T{"T-inside-W2"}}
+	w3 := &W3{&W1{T{"T-inside-W1"}}, T{"T-inside-W3"}}
+	w4 := &W4{&W1{T{"T-inside-W1"}}}
+	w5 := &W5{nil}
+	w5.W5 = w5
+
+	tim1 := time.Unix(233431200, 0)
+	loc, _ := time.LoadLocation("Mexico/BajaSur")
+	tim2, _ := time.ParseInLocation("2006-01-02 15:04:05", "2022-06-07 02:03:04", loc)
+
 	var amb1 = 1
 	runtime.Breakpoint()
 	for amb1 := 0; amb1 < 10; amb1++ {
 		fmt.Println(amb1)
 	}
 
+	longarr := [100]int{}
+	longslice := make([]int, 100, 100)
+
 	runtime.Breakpoint()
-	fmt.Println(i1, i2, i3, p1, amb1, s1, s3, a0, a1, p2, p3, s2, as1, str1, f1, fn1, fn2, nilslice, nilptr, ch1, chnil, m1, mnil, m2, m3, m4, upnil, up1, i4, i5, i6, err1, err2, errnil, iface1, iface2, ifacenil, arr1, parr, cpx1, const1, iface3, iface4, recursive1, recursive1.x, iface5, iface2fn1, iface2fn2, bencharr, benchparr, mapinf, mainMenu, b, b2, sd, anonstruct1, anonstruct2, anoniface1, anonfunc, mapanonstruct1, ifacearr, efacearr, ni8, ni16, ni32, ni64, pinf, ninf, nan, zsvmap, zsslice, zsvar, tm, errtypednil, emptyslice, emptymap, byteslice, runeslice, bytearray, runearray, longstr, nilstruct, as2, as2.NonPointerRecieverMethod, s4, iface2map, issue1578, ll, unread)
+	fmt.Println(i1, i2, i3, p1, pp1, amb1, s1, s3, a0, a1, p2, p3, s2, as1, str1, f1, fn1, fn2, nilslice, nilptr, ch1, chnil, m1, mnil, m2, m3, m4, m5, upnil, up1, i4, i5, i6, err1, err2, errnil, iface1, iface2, ifacenil, arr1, parr, cpx1, const1, iface3, iface4, recursive1, recursive1.x, iface5, iface2fn1, iface2fn2, bencharr, benchparr, mapinf, mainMenu, b, b2, sd, anonstruct1, anonstruct2, anoniface1, anonfunc, mapanonstruct1, ifacearr, efacearr, ni8, ni16, ni32, ni64, pinf, ninf, nan, zsvmap, zsslice, zsvar, tm, rettm, errtypednil, emptyslice, emptymap, byteslice, bytestypeslice, runeslice, bytearray, bytetypearray, runearray, longstr, nilstruct, as2, as2.NonPointerRecieverMethod, s4, iface2map, issue1578, ll, unread, w2, w3, w4, w5, longarr, longslice, val, m6, m7, cl, tim1, tim2)
 }

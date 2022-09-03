@@ -16,9 +16,9 @@ import (
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/logflags"
-	"golang.org/x/arch/x86/x86asm"
 )
 
 // This file implements the function call injection introduced in go1.11.
@@ -42,7 +42,7 @@ import (
 const (
 	debugCallFunctionNamePrefix1 = "debugCall"
 	debugCallFunctionNamePrefix2 = "runtime.debugCall"
-	debugCallFunctionName        = "runtime.debugCallV1"
+	maxDebugCallVersion          = 2
 	maxArgFrameSize              = 65535
 )
 
@@ -50,13 +50,11 @@ var (
 	errFuncCallUnsupported        = errors.New("function calls not supported by this version of Go")
 	errFuncCallUnsupportedBackend = errors.New("backend does not support function calls")
 	errFuncCallInProgress         = errors.New("cannot call function while another function call is already in progress")
-	errNotACallExpr               = errors.New("not a function call")
 	errNoGoroutine                = errors.New("no goroutine selected")
 	errGoroutineNotRunning        = errors.New("selected goroutine not running")
 	errNotEnoughStack             = errors.New("not enough stack space")
 	errTooManyArguments           = errors.New("too many arguments")
 	errNotEnoughArguments         = errors.New("not enough arguments")
-	errNoAddrUnsupported          = errors.New("arguments to a function call must have an address")
 	errNotAGoFunction             = errors.New("not a Go function")
 	errFuncCallNotAllowed         = errors.New("function calls not allowed without using 'call'")
 	errFuncCallNotAllowedStrAlloc = errors.New("literal string can not be allocated because function calls are not allowed without using 'call'")
@@ -130,6 +128,7 @@ type callInjection struct {
 	continueCompleted chan<- *G
 	continueRequest   <-chan continueRequest
 	startThreadID     int
+	endCallInjection  func()
 }
 
 func (callCtx *callContext) doContinue() *G {
@@ -147,7 +146,8 @@ func (callCtx *callContext) doReturn(ret *Variable, err error) {
 // EvalExpressionWithCalls is like EvalExpression but allows function calls in 'expr'.
 // Because this can only be done in the current goroutine, unlike
 // EvalExpression, EvalExpressionWithCalls is not a method of EvalScope.
-func EvalExpressionWithCalls(t *Target, g *G, expr string, retLoadCfg LoadConfig, checkEscape bool) error {
+func EvalExpressionWithCalls(grp *TargetGroup, g *G, expr string, retLoadCfg LoadConfig, checkEscape bool) error {
+	t := grp.Selected
 	bi := t.BinInfo()
 	if !t.SupportsFunctionCalls() {
 		return errFuncCallUnsupportedBackend
@@ -165,12 +165,12 @@ func EvalExpressionWithCalls(t *Target, g *G, expr string, retLoadCfg LoadConfig
 		return errFuncCallInProgress
 	}
 
-	dbgcallfn := bi.LookupFunc[debugCallFunctionName]
+	dbgcallfn, _ := debugCallFunction(bi)
 	if dbgcallfn == nil {
 		return errFuncCallUnsupported
 	}
 
-	scope, err := GoroutineScope(g.Thread)
+	scope, err := GoroutineScope(t, g.Thread)
 	if err != nil {
 		return err
 	}
@@ -186,17 +186,23 @@ func EvalExpressionWithCalls(t *Target, g *G, expr string, retLoadCfg LoadConfig
 		continueCompleted: continueCompleted,
 	}
 
+	endCallInjection, err := t.proc.StartCallInjection()
+	if err != nil {
+		return err
+	}
+
 	t.fncallForG[g.ID] = &callInjection{
 		continueCompleted: continueCompleted,
 		continueRequest:   continueRequest,
 		startThreadID:     0,
+		endCallInjection:  endCallInjection,
 	}
 
 	go scope.EvalExpression(expr, retLoadCfg)
 
 	contReq, ok := <-continueRequest
 	if contReq.cont {
-		return t.Continue()
+		return grp.Continue()
 	}
 
 	return finishEvalExpressionWithCalls(t, g, contReq, ok)
@@ -204,6 +210,7 @@ func EvalExpressionWithCalls(t *Target, g *G, expr string, retLoadCfg LoadConfig
 
 func finishEvalExpressionWithCalls(t *Target, g *G, contReq continueRequest, ok bool) error {
 	fncallLog("stashing return values for %d in thread=%d", g.ID, g.Thread.ThreadID())
+	g.Thread.Common().CallReturn = true
 	var err error
 	if !ok {
 		err = errors.New("internal error EvalExpressionWithCalls didn't return anything")
@@ -227,7 +234,13 @@ func finishEvalExpressionWithCalls(t *Target, g *G, contReq continueRequest, ok 
 	}
 
 	close(t.fncallForG[g.ID].continueCompleted)
-	delete(t.fncallForG, g.ID)
+	callinj := t.fncallForG[g.ID]
+	for goid := range t.fncallForG {
+		if t.fncallForG[goid] == callinj {
+			delete(t.fncallForG, goid)
+		}
+	}
+	callinj.endCallInjection()
 	return err
 }
 
@@ -254,7 +267,7 @@ func evalFunctionCall(scope *EvalScope, node *ast.CallExpr) (*Variable, error) {
 	if thread == nil {
 		// We are doing a nested function call and using Go 1.15, the original
 		// injection goroutine was suspended and now we are using a different
-		// goroutine, evaluation still happend on the original goroutine but we
+		// goroutine, evaluation still happened on the original goroutine but we
 		// need to use a different thread to do the nested call injection.
 		thread = scope.callCtx.injectionThread
 		g2, err := GetG(thread)
@@ -273,7 +286,7 @@ func evalFunctionCall(scope *EvalScope, node *ast.CallExpr) (*Variable, error) {
 		return nil, errFuncCallUnsupportedBackend
 	}
 
-	dbgcallfn := bi.LookupFunc[debugCallFunctionName]
+	dbgcallfn, dbgcallversion := debugCallFunction(bi)
 	if dbgcallfn == nil {
 		return nil, errFuncCallUnsupported
 	}
@@ -287,11 +300,14 @@ func evalFunctionCall(scope *EvalScope, node *ast.CallExpr) (*Variable, error) {
 	if err != nil {
 		return nil, err
 	}
-	if regs.SP()-256 <= stacklo {
+	if regs.SP()-bi.Arch.debugCallMinStackSize <= stacklo {
 		return nil, errNotEnoughStack
 	}
-	_, err = regs.Get(int(x86asm.RAX))
-	if err != nil {
+	protocolReg, ok := debugCallProtocolReg(bi.Arch.Name, dbgcallversion)
+	if !ok {
+		return nil, errFuncCallUnsupported
+	}
+	if bi.Arch.RegistersToDwarfRegisters(0, regs).Reg(protocolReg) == nil {
 		return nil, errFuncCallUnsupportedBackend
 	}
 
@@ -305,16 +321,49 @@ func evalFunctionCall(scope *EvalScope, node *ast.CallExpr) (*Variable, error) {
 		return nil, err
 	}
 
-	if err := callOP(bi, thread, regs, dbgcallfn.Entry); err != nil {
-		return nil, err
-	}
-	// write the desired argument frame size at SP-(2*pointer_size) (the extra pointer is the saved PC)
-	if err := writePointer(bi, thread, regs.SP()-3*uint64(bi.Arch.PtrSize()), uint64(fncall.argFrameSize)); err != nil {
-		return nil, err
+	switch bi.Arch.Name {
+	case "amd64":
+		if err := callOP(bi, thread, regs, dbgcallfn.Entry); err != nil {
+			return nil, err
+		}
+		// write the desired argument frame size at SP-(2*pointer_size) (the extra pointer is the saved PC)
+		if err := writePointer(bi, scope.Mem, regs.SP()-3*uint64(bi.Arch.PtrSize()), uint64(fncall.argFrameSize)); err != nil {
+			return nil, err
+		}
+	case "arm64":
+		// debugCallV2 on arm64 needs a special call sequence, callOP can not be used
+		sp := regs.SP()
+		sp -= 2 * uint64(bi.Arch.PtrSize())
+		if err := setSP(thread, sp); err != nil {
+			return nil, err
+		}
+		if err := writePointer(bi, scope.Mem, sp, regs.LR()); err != nil {
+			return nil, err
+		}
+		if err := setLR(thread, regs.PC()); err != nil {
+			return nil, err
+		}
+		if err := writePointer(bi, scope.Mem, sp-uint64(2*bi.Arch.PtrSize()), uint64(fncall.argFrameSize)); err != nil {
+			return nil, err
+		}
+		regs, err = thread.Registers()
+		if err != nil {
+			return nil, err
+		}
+		regs, err = regs.Copy()
+		if err != nil {
+			return nil, err
+		}
+		fncall.savedRegs = regs
+		err = setPC(thread, dbgcallfn.Entry)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	fncallLog("function call initiated %v frame size %d goroutine %d (thread %d)", fncall.fn, fncall.argFrameSize, scope.g.ID, thread.ThreadID())
 
+	thread.Breakpoint().Clear() // since we moved address in PC the thread is no longer stopped at a breakpoint, leaving the breakpoint set will confuse Continue
 	p.fncallForG[scope.g.ID].startThreadID = thread.ThreadID()
 
 	spoff := int64(scope.Regs.Uint64Val(scope.Regs.SPRegNum)) - int64(scope.g.stack.hi)
@@ -348,7 +397,7 @@ func evalFunctionCall(scope *EvalScope, node *ast.CallExpr) (*Variable, error) {
 		scope.Regs.FrameBase = fboff + int64(scope.g.stack.hi)
 		scope.Regs.CFA = scope.frameOffset + int64(scope.g.stack.hi)
 
-		finished := funcCallStep(scope, &fncall, g.Thread)
+		finished := funcCallStep(scope, &fncall, g.Thread, protocolReg, dbgcallfn.Name)
 		if finished {
 			break
 		}
@@ -387,7 +436,7 @@ type fncallPanicErr struct {
 }
 
 func (err fncallPanicErr) Error() string {
-	return fmt.Sprintf("panic calling a function")
+	return "panic calling a function"
 }
 
 func fncallLog(fmtstr string, args ...interface{}) {
@@ -407,7 +456,7 @@ func writePointer(bi *BinaryInfo, mem MemoryReadWriter, addr, val uint64) error 
 	default:
 		panic(fmt.Errorf("unsupported pointer size %d", len(ptrbuf)))
 	}
-	_, err := mem.WriteMemory(uintptr(addr), ptrbuf)
+	_, err := mem.WriteMemory(addr, ptrbuf)
 	return err
 }
 
@@ -416,16 +465,26 @@ func writePointer(bi *BinaryInfo, mem MemoryReadWriter, addr, val uint64) error 
 // * changes the value of PC to callAddr
 // Note: regs are NOT updated!
 func callOP(bi *BinaryInfo, thread Thread, regs Registers, callAddr uint64) error {
-	sp := regs.SP()
-	// push PC on the stack
-	sp -= uint64(bi.Arch.PtrSize())
-	if err := thread.SetSP(sp); err != nil {
-		return err
+	switch bi.Arch.Name {
+	case "amd64":
+		sp := regs.SP()
+		// push PC on the stack
+		sp -= uint64(bi.Arch.PtrSize())
+		if err := setSP(thread, sp); err != nil {
+			return err
+		}
+		if err := writePointer(bi, thread.ProcessMemory(), sp, regs.PC()); err != nil {
+			return err
+		}
+		return setPC(thread, callAddr)
+	case "arm64":
+		if err := setLR(thread, regs.PC()); err != nil {
+			return err
+		}
+		return setPC(thread, callAddr)
+	default:
+		panic("not implemented")
 	}
-	if err := writePointer(bi, thread, sp, regs.PC()); err != nil {
-		return err
-	}
-	return thread.SetPC(callAddr)
 }
 
 // funcCallEvalFuncExpr evaluates expr.Fun and returns the function that we're trying to call.
@@ -499,22 +558,23 @@ func funcCallEvalFuncExpr(scope *EvalScope, fncall *functionCallState, allowCall
 }
 
 type funcCallArg struct {
-	name  string
-	typ   godwarf.Type
-	off   int64
-	isret bool
+	name       string
+	typ        godwarf.Type
+	off        int64
+	dwarfEntry *godwarf.Tree // non-nil if Go 1.17+
+	isret      bool
 }
 
 // funcCallEvalArgs evaluates the arguments of the function call, copying
-// the into the argument frame starting at argFrameAddr.
-func funcCallEvalArgs(scope *EvalScope, fncall *functionCallState, argFrameAddr uint64) error {
+// them into the argument frame starting at argFrameAddr.
+func funcCallEvalArgs(scope *EvalScope, fncall *functionCallState, formalScope *EvalScope) error {
 	if scope.g == nil {
 		// this should never happen
 		return errNoGoroutine
 	}
 
 	if fncall.receiver != nil {
-		err := funcCallCopyOneArg(scope, fncall, fncall.receiver, &fncall.formalArgs[0], argFrameAddr)
+		err := funcCallCopyOneArg(scope, fncall, fncall.receiver, &fncall.formalArgs[0], formalScope)
 		if err != nil {
 			return err
 		}
@@ -526,11 +586,14 @@ func funcCallEvalArgs(scope *EvalScope, fncall *functionCallState, argFrameAddr 
 
 		actualArg, err := scope.evalAST(fncall.expr.Args[i])
 		if err != nil {
+			if _, ispanic := err.(fncallPanicErr); ispanic {
+				return err
+			}
 			return fmt.Errorf("error evaluating %q as argument %s in function %s: %v", exprToString(fncall.expr.Args[i]), formalArg.name, fncall.fn.Name, err)
 		}
 		actualArg.Name = exprToString(fncall.expr.Args[i])
 
-		err = funcCallCopyOneArg(scope, fncall, actualArg, formalArg, argFrameAddr)
+		err = funcCallCopyOneArg(scope, fncall, actualArg, formalArg, formalScope)
 		if err != nil {
 			return err
 		}
@@ -539,7 +602,7 @@ func funcCallEvalArgs(scope *EvalScope, fncall *functionCallState, argFrameAddr 
 	return nil
 }
 
-func funcCallCopyOneArg(scope *EvalScope, fncall *functionCallState, actualArg *Variable, formalArg *funcCallArg, argFrameAddr uint64) error {
+func funcCallCopyOneArg(scope *EvalScope, fncall *functionCallState, actualArg *Variable, formalArg *funcCallArg, formalScope *EvalScope) error {
 	if scope.callCtx.checkEscape {
 		//TODO(aarzilli): only apply the escapeCheck to leaking parameters.
 		if err := escapeCheck(actualArg, formalArg.name, scope.g.stack); err != nil {
@@ -555,7 +618,16 @@ func funcCallCopyOneArg(scope *EvalScope, fncall *functionCallState, actualArg *
 	//TODO(aarzilli): autmoatic wrapping in interfaces for cases not handled
 	// by convertToEface.
 
-	formalArgVar := newVariable(formalArg.name, uintptr(formalArg.off+int64(argFrameAddr)), formalArg.typ, scope.BinInfo, scope.Mem)
+	var formalArgVar *Variable
+	if formalArg.dwarfEntry != nil {
+		var err error
+		formalArgVar, err = extractVarInfoFromEntry(scope.target, formalScope.BinInfo, formalScope.image(), formalScope.Regs, formalScope.Mem, formalArg.dwarfEntry, 0)
+		if err != nil {
+			return err
+		}
+	} else {
+		formalArgVar = newVariable(formalArg.name, uint64(formalArg.off+int64(formalScope.Regs.CFA)), formalArg.typ, scope.BinInfo, scope.Mem)
+	}
 	if err := scope.setValue(formalArgVar, actualArg, actualArg.Name); err != nil {
 		return err
 	}
@@ -564,16 +636,26 @@ func funcCallCopyOneArg(scope *EvalScope, fncall *functionCallState, actualArg *
 }
 
 func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize int64, formalArgs []funcCallArg, err error) {
-	const CFA = 0x1000
-
 	dwarfTree, err := fn.cu.image.getDwarfTree(fn.offset)
 	if err != nil {
 		return 0, nil, fmt.Errorf("DWARF read error: %v", err)
 	}
 
-	varEntries := reader.Variables(dwarfTree, fn.Entry, int(^uint(0)>>1), reader.VariablesSkipInlinedSubroutines)
+	producer := bi.Producer()
+	trustArgOrder := producer != "" && goversion.ProducerAfterOrEqual(bi.Producer(), 1, 12)
 
-	trustArgOrder := bi.Producer() != "" && goversion.ProducerAfterOrEqual(bi.Producer(), 1, 12)
+	if bi.regabi && fn.cu.optimized && fn.Name != "runtime.mallocgc" {
+		// Debug info for function arguments on optimized functions is currently
+		// too incomplete to attempt injecting calls to arbitrary optimized
+		// functions.
+		// Prior to regabi we could do this because the ABI was simple enough to
+		// manually encode it in Delve.
+		// Runtime.mallocgc is an exception, we specifically patch it's DIE to be
+		// correct for call injection purposes.
+		return 0, nil, fmt.Errorf("can not call optimized function %s when regabi is in use", fn.Name)
+	}
+
+	varEntries := reader.Variables(dwarfTree, fn.Entry, int(^uint(0)>>1), reader.VariablesSkipInlinedSubroutines)
 
 	// typechecks arguments, calculates argument frame size
 	for _, entry := range varEntries {
@@ -585,44 +667,37 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 			return 0, nil, err
 		}
 		typ = resolveTypedef(typ)
-		var off int64
 
-		locprog, _, err := bi.locationExpr(entry, dwarf.AttrLocation, fn.Entry)
-		if err != nil {
-			err = fmt.Errorf("could not get argument location of %s: %v", argname, err)
+		var formalArg *funcCallArg
+		if bi.regabi {
+			formalArg, err = funcCallArgRegABI(fn, bi, entry, argname, typ, &argFrameSize)
 		} else {
-			var pieces []op.Piece
-			off, pieces, err = op.ExecuteStackProgram(op.DwarfRegisters{CFA: CFA, FrameBase: CFA}, locprog, bi.Arch.PtrSize())
-			if err != nil {
-				err = fmt.Errorf("unsupported location expression for argument %s: %v", argname, err)
-			}
-			if pieces != nil {
-				err = fmt.Errorf("unsupported location expression for argument %s (uses DW_OP_piece)", argname)
-			}
-			off -= CFA
+			formalArg, err = funcCallArgOldABI(fn, bi, entry, argname, typ, trustArgOrder, &argFrameSize)
 		}
 		if err != nil {
-			if !trustArgOrder {
-				return 0, nil, err
-			}
-
-			// With Go version 1.12 or later we can trust that the arguments appear
-			// in the same order as declared, which means we can calculate their
-			// address automatically.
-			// With this we can call optimized functions (which sometimes do not have
-			// an argument address, due to a compiler bug) as well as runtime
-			// functions (which are always optimized).
-			off = argFrameSize
-			off = alignAddr(off, typ.Align())
+			return 0, nil, err
 		}
-
-		if e := off + typ.Size(); e > argFrameSize {
-			argFrameSize = e
+		if !formalArg.isret || includeRet {
+			formalArgs = append(formalArgs, *formalArg)
 		}
+	}
 
-		if isret, _ := entry.Val(dwarf.AttrVarParam).(bool); !isret || includeRet {
-			formalArgs = append(formalArgs, funcCallArg{name: argname, typ: typ, off: off, isret: isret})
-		}
+	if bi.regabi {
+		// The argument frame size is computed conservatively, assuming that
+		// there's space for each argument on the stack even if its passed in
+		// registers. Unfortunately this isn't quite enough because the register
+		// assignment algorithm Go uses can result in an amount of additional
+		// space used due to alignment requirements, bounded by the number of argument registers.
+		// Because we currently don't have an easy way to obtain the frame size,
+		// let's be even more conservative.
+		// A safe lower-bound on the size of the argument frame includes space for
+		// each argument plus the total bytes of register arguments.
+		// This is derived from worst-case alignment padding of up to
+		// (pointer-word-bytes - 1) per argument passed in registers.
+		// See: https://github.com/go-delve/delve/pull/2451#discussion_r665761531
+		// TODO: Make this generic for other platforms.
+		argFrameSize = alignAddr(argFrameSize, 8)
+		argFrameSize += int64(bi.Arch.maxRegArgBytes)
 	}
 
 	sort.Slice(formalArgs, func(i, j int) bool {
@@ -630,6 +705,56 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 	})
 
 	return argFrameSize, formalArgs, nil
+}
+
+func funcCallArgOldABI(fn *Function, bi *BinaryInfo, entry reader.Variable, argname string, typ godwarf.Type, trustArgOrder bool, pargFrameSize *int64) (*funcCallArg, error) {
+	const CFA = 0x1000
+	var off int64
+
+	locprog, _, err := bi.locationExpr(entry, dwarf.AttrLocation, fn.Entry)
+	if err != nil {
+		err = fmt.Errorf("could not get argument location of %s: %v", argname, err)
+	} else {
+		var pieces []op.Piece
+		off, pieces, err = op.ExecuteStackProgram(op.DwarfRegisters{CFA: CFA, FrameBase: CFA}, locprog, bi.Arch.PtrSize(), nil)
+		if err != nil {
+			err = fmt.Errorf("unsupported location expression for argument %s: %v", argname, err)
+		}
+		if pieces != nil {
+			err = fmt.Errorf("unsupported location expression for argument %s (uses DW_OP_piece)", argname)
+		}
+		off -= CFA
+	}
+	if err != nil {
+		if !trustArgOrder {
+			return nil, err
+		}
+
+		// With Go version 1.12 or later we can trust that the arguments appear
+		// in the same order as declared, which means we can calculate their
+		// address automatically.
+		// With this we can call optimized functions (which sometimes do not have
+		// an argument address, due to a compiler bug) as well as runtime
+		// functions (which are always optimized).
+		off = *pargFrameSize
+		off = alignAddr(off, typ.Align())
+	}
+
+	if e := off + typ.Size(); e > *pargFrameSize {
+		*pargFrameSize = e
+	}
+
+	isret, _ := entry.Val(dwarf.AttrVarParam).(bool)
+	return &funcCallArg{name: argname, typ: typ, off: off, isret: isret}, nil
+}
+
+func funcCallArgRegABI(fn *Function, bi *BinaryInfo, entry reader.Variable, argname string, typ godwarf.Type, pargFrameSize *int64) (*funcCallArg, error) {
+	// Conservatively calculate the full stack argument space for ABI0.
+	*pargFrameSize = alignAddr(*pargFrameSize, typ.Align())
+	*pargFrameSize += typ.Size()
+
+	isret, _ := entry.Val(dwarf.AttrVarParam).(bool)
+	return &funcCallArg{name: argname, typ: typ, dwarfEntry: entry.Tree, isret: isret}, nil
 }
 
 // alignAddr rounds up addr to a multiple of align. Align must be a power of 2.
@@ -671,7 +796,7 @@ func escapeCheck(v *Variable, name string, stack stack) error {
 			}
 		}
 	case reflect.Func:
-		if err := escapeCheckPointer(uintptr(v.funcvalAddr()), name, stack); err != nil {
+		if err := escapeCheckPointer(v.funcvalAddr(), name, stack); err != nil {
 			return err
 		}
 	}
@@ -679,7 +804,7 @@ func escapeCheck(v *Variable, name string, stack stack) error {
 	return nil
 }
 
-func escapeCheckPointer(addr uintptr, name string, stack stack) error {
+func escapeCheckPointer(addr uint64, name string, stack stack) error {
 	if uint64(addr) >= stack.lo && uint64(addr) < stack.hi {
 		return fmt.Errorf("stack object passed to escaping pointer: %s", name)
 	}
@@ -687,15 +812,15 @@ func escapeCheckPointer(addr uintptr, name string, stack stack) error {
 }
 
 const (
-	debugCallAXPrecheckFailed   = 8
-	debugCallAXCompleteCall     = 0
-	debugCallAXReadReturn       = 1
-	debugCallAXReadPanic        = 2
-	debugCallAXRestoreRegisters = 16
+	debugCallRegPrecheckFailed   = 8
+	debugCallRegCompleteCall     = 0
+	debugCallRegReadReturn       = 1
+	debugCallRegReadPanic        = 2
+	debugCallRegRestoreRegisters = 16
 )
 
 // funcCallStep executes one step of the function call injection protocol.
-func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread) bool {
+func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread, protocolReg uint64, debugCallName string) bool {
 	p := callScope.callCtx.p
 	bi := p.BinInfo()
 
@@ -705,7 +830,7 @@ func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread
 		return true
 	}
 
-	rax, _ := regs.Get(int(x86asm.RAX))
+	regval := bi.Arch.RegistersToDwarfRegisters(0, regs).Uint64Val(protocolReg)
 
 	if logflags.FnCall() {
 		loc, _ := thread.Location()
@@ -717,13 +842,17 @@ func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread
 				fnname = loc.Fn.Name
 			}
 		}
-		fncallLog("function call interrupt gid=%d (original) thread=%d rax=%#x (PC=%#x in %s)", callScope.g.ID, thread.ThreadID(), rax, pc, fnname)
+		fncallLog("function call interrupt gid=%d (original) thread=%d regval=%#x (PC=%#x in %s)", callScope.g.ID, thread.ThreadID(), regval, pc, fnname)
 	}
 
-	switch rax {
-	case debugCallAXPrecheckFailed:
+	switch regval {
+	case debugCallRegPrecheckFailed: // 8
+		archoff := uint64(0)
+		if bi.Arch.Name == "arm64" {
+			archoff = 8
+		}
 		// get error from top of the stack and return it to user
-		errvar, err := readTopstackVariable(thread, regs, "string", loadFullValue)
+		errvar, err := readStackVariable(p, thread, regs, archoff, "string", loadFullValue)
 		if err != nil {
 			fncall.err = fmt.Errorf("could not get precheck error reason: %v", err)
 			break
@@ -731,8 +860,9 @@ func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread
 		errvar.Name = "err"
 		fncall.err = fmt.Errorf("%v", constant.StringVal(errvar.Value))
 
-	case debugCallAXCompleteCall:
+	case debugCallRegCompleteCall: // 0
 		p.fncallForG[callScope.g.ID].startThreadID = 0
+
 		// evaluate arguments of the target function, copy them into its argument frame and call the function
 		if fncall.fn == nil || fncall.receiver != nil || fncall.closureAddr != 0 {
 			// if we couldn't figure out which function we are calling before
@@ -759,46 +889,76 @@ func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread
 		if fncall.closureAddr != 0 {
 			// When calling a function pointer we must set the DX register to the
 			// address of the function pointer itself.
-			thread.SetDX(fncall.closureAddr)
+			setClosureReg(thread, fncall.closureAddr)
 		}
 		cfa := regs.SP()
 		oldpc := regs.PC()
+		var oldlr uint64
+		if bi.Arch.Name == "arm64" {
+			oldlr = regs.LR()
+		}
 		callOP(bi, thread, regs, fncall.fn.Entry)
+		formalScope, err := GoroutineScope(callScope.target, thread)
+		if formalScope != nil && formalScope.Regs.CFA != int64(cfa) {
+			// This should never happen, checking just to avoid hard to figure out disasters.
+			err = fmt.Errorf("mismatch in CFA %#x (calculated) %#x (expected)", formalScope.Regs.CFA, int64(cfa))
+		}
+		if err == nil {
+			err = funcCallEvalArgs(callScope, fncall, formalScope)
+		}
 
-		err := funcCallEvalArgs(callScope, fncall, cfa)
 		if err != nil {
 			// rolling back the call, note: this works because we called regs.Copy() above
-			thread.SetSP(cfa)
-			thread.SetPC(oldpc)
+			switch bi.Arch.Name {
+			case "amd64":
+				setSP(thread, cfa)
+				setPC(thread, oldpc)
+			case "arm64":
+				setLR(thread, oldlr)
+				setPC(thread, oldpc)
+			default:
+				panic("not implemented")
+			}
 			fncall.err = err
 			fncall.lateCallFailure = true
 			break
 		}
 
-	case debugCallAXRestoreRegisters:
+	case debugCallRegRestoreRegisters: // 16
 		// runtime requests that we restore the registers (all except pc and sp),
 		// this is also the last step of the function call protocol.
 		pc, sp := regs.PC(), regs.SP()
 		if err := thread.RestoreRegisters(fncall.savedRegs); err != nil {
 			fncall.err = fmt.Errorf("could not restore registers: %v", err)
 		}
-		if err := thread.SetPC(pc); err != nil {
+		if err := setPC(thread, pc); err != nil {
 			fncall.err = fmt.Errorf("could not restore PC: %v", err)
 		}
-		if err := thread.SetSP(sp); err != nil {
+		if err := setSP(thread, sp); err != nil {
 			fncall.err = fmt.Errorf("could not restore SP: %v", err)
 		}
-		if err := stepInstructionOut(p, thread, debugCallFunctionName, debugCallFunctionName); err != nil {
-			fncall.err = fmt.Errorf("could not step out of %s: %v", debugCallFunctionName, err)
+		if err := stepInstructionOut(p, thread, debugCallName, debugCallName); err != nil {
+			fncall.err = fmt.Errorf("could not step out of %s: %v", debugCallName, err)
+		}
+		if bi.Arch.Name == "amd64" {
+			// The tail of debugCallV2 corrupts the state of RFLAGS, we must restore
+			// it one extra time after stepping out of it.
+			// See https://github.com/go-delve/delve/issues/2985 and
+			// TestCallInjectionFlagCorruption
+			rflags := bi.Arch.RegistersToDwarfRegisters(0, fncall.savedRegs).Uint64Val(regnum.AMD64_Rflags)
+			err := thread.SetReg(regnum.AMD64_Rflags, op.DwarfRegisterFromUint64(rflags))
+			if err != nil {
+				fncall.err = fmt.Errorf("could not restore RFLAGS register: %v", err)
+			}
 		}
 		return true
 
-	case debugCallAXReadReturn:
+	case debugCallRegReadReturn: // 1
 		// read return arguments from stack
 		if fncall.panicvar != nil || fncall.lateCallFailure {
 			break
 		}
-		retScope, err := ThreadScope(thread)
+		retScope, err := ThreadScope(p, thread)
 		if err != nil {
 			fncall.err = fmt.Errorf("could not get return values: %v", err)
 			break
@@ -806,8 +966,13 @@ func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread
 
 		// pretend we are still inside the function we called
 		fakeFunctionEntryScope(retScope, fncall.fn, int64(regs.SP()), regs.SP()-uint64(bi.Arch.PtrSize()))
+		var flags localsFlags
+		flags |= localsNoDeclLineCheck // if the function we are calling is an autogenerated stub then declaration lines have no meaning
+		if !bi.regabi {
+			flags |= localsTrustArgOrder
+		}
 
-		fncall.retvars, err = retScope.Locals()
+		fncall.retvars, err = retScope.Locals(flags)
 		if err != nil {
 			fncall.err = fmt.Errorf("could not get return values: %v", err)
 			break
@@ -827,10 +992,25 @@ func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread
 		if threadg, _ := GetG(thread); threadg != nil {
 			callScope.callCtx.stacks = append(callScope.callCtx.stacks, threadg.stack)
 		}
+		if bi.Arch.Name == "arm64" {
+			oldlr, err := readUintRaw(thread.ProcessMemory(), regs.SP(), int64(bi.Arch.PtrSize()))
+			if err != nil {
+				fncall.err = fmt.Errorf("could not restore LR: %v", err)
+				break
+			}
+			if err = setLR(thread, oldlr); err != nil {
+				fncall.err = fmt.Errorf("could not restore LR: %v", err)
+				break
+			}
+		}
 
-	case debugCallAXReadPanic:
+	case debugCallRegReadPanic: // 2
 		// read panic value from stack
-		fncall.panicvar, err = readTopstackVariable(thread, regs, "interface {}", callScope.callCtx.retLoadCfg)
+		archoff := uint64(0)
+		if bi.Arch.Name == "arm64" {
+			archoff = 8
+		}
+		fncall.panicvar, err = readStackVariable(p, thread, regs, archoff, "interface {}", callScope.callCtx.retLoadCfg)
 		if err != nil {
 			fncall.err = fmt.Errorf("could not get panic: %v", err)
 			break
@@ -838,17 +1018,17 @@ func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread
 		fncall.panicvar.Name = "~panic"
 
 	default:
-		// Got an unknown AX value, this is probably bad but the safest thing
+		// Got an unknown protocol register value, this is probably bad but the safest thing
 		// possible is to ignore it and hope it didn't matter.
-		fncallLog("unknown value of AX %#x", rax)
+		fncallLog("unknown value of protocol register %#x", regval)
 	}
 
 	return false
 }
 
-func readTopstackVariable(thread Thread, regs Registers, typename string, loadCfg LoadConfig) (*Variable, error) {
+func readStackVariable(t *Target, thread Thread, regs Registers, off uint64, typename string, loadCfg LoadConfig) (*Variable, error) {
 	bi := thread.BinInfo()
-	scope, err := ThreadScope(thread)
+	scope, err := ThreadScope(t, thread)
 	if err != nil {
 		return nil, err
 	}
@@ -856,7 +1036,7 @@ func readTopstackVariable(thread Thread, regs Registers, typename string, loadCf
 	if err != nil {
 		return nil, err
 	}
-	v := newVariable("", uintptr(regs.SP()), typ, scope.BinInfo, scope.Mem)
+	v := newVariable("", regs.SP()+off, typ, scope.BinInfo, scope.Mem)
 	v.loadValue(loadCfg)
 	if v.Unreadable != nil {
 		return nil, v.Unreadable
@@ -877,21 +1057,15 @@ func fakeFunctionEntryScope(scope *EvalScope, fn *Function, cfa int64, sp uint64
 
 	scope.Regs.CFA = cfa
 	scope.Regs.Reg(scope.Regs.SPRegNum).Uint64Val = sp
+	scope.Regs.Reg(scope.Regs.PCRegNum).Uint64Val = fn.Entry
 
 	fn.cu.image.dwarfReader.Seek(fn.offset)
 	e, err := fn.cu.image.dwarfReader.Next()
 	if err != nil {
 		return err
 	}
-	scope.Regs.FrameBase, _, _, _ = scope.BinInfo.Location(e, dwarf.AttrFrameBase, scope.PC, scope.Regs)
+	scope.Regs.FrameBase, _, _, _ = scope.BinInfo.Location(e, dwarf.AttrFrameBase, scope.PC, scope.Regs, nil)
 	return nil
-}
-
-func (fncall *functionCallState) returnValues() []*Variable {
-	if fncall.panicvar != nil {
-		return []*Variable{fncall.panicvar}
-	}
-	return fncall.retvars
 }
 
 // allocString allocates spaces for the contents of v if it needs to be allocated
@@ -932,7 +1106,7 @@ func allocString(scope *EvalScope, v *Variable) error {
 	if len(mallocv.Children) != 1 {
 		return errors.New("internal error, could not interpret return value of mallocgc call")
 	}
-	v.Base = uintptr(mallocv.Children[0].Addr)
+	v.Base = mallocv.Children[0].Addr
 	_, err = scope.Mem.WriteMemory(v.Base, []byte(constant.StringVal(v.Value)))
 	return err
 }
@@ -944,7 +1118,15 @@ func isCallInjectionStop(t *Target, thread Thread, loc *Location) bool {
 	if !strings.HasPrefix(loc.Fn.Name, debugCallFunctionNamePrefix1) && !strings.HasPrefix(loc.Fn.Name, debugCallFunctionNamePrefix2) {
 		return false
 	}
-	text, err := disassembleCurrentInstruction(t, thread, -1)
+	if loc.PC == loc.Fn.Entry {
+		// call injection just started, did not make any progress before being interrupted by a concurrent breakpoint.
+		return false
+	}
+	off := int64(0)
+	if thread.BinInfo().Arch.breakInstrMovesPC {
+		off = -int64(len(thread.BinInfo().Arch.breakpointInstruction))
+	}
+	text, err := disassembleCurrentInstruction(t, thread, off)
 	if err != nil || len(text) <= 0 {
 		return false
 	}
@@ -971,6 +1153,11 @@ func callInjectionProtocol(t *Target, threads []Thread) (done bool, err error) {
 		g, callinj, err := findCallInjectionStateForThread(t, thread)
 		if err != nil {
 			return false, err
+		}
+
+		arch := thread.BinInfo().Arch
+		if !arch.breakInstrMovesPC {
+			setPC(thread, loc.PC+uint64(len(arch.breakpointInstruction)))
 		}
 
 		fncallLog("step for injection on goroutine %d (current) thread=%d (location %s)", g.ID, thread.ThreadID(), loc.Fn.Name)
@@ -1018,4 +1205,106 @@ func findCallInjectionStateForThread(t *Target, thread Thread) (*G, *callInjecti
 	}
 
 	return nil, nil, notfound()
+}
+
+// debugCallFunction searches for the debug call function in the binary and
+// uses this search to detect the debug call version.
+// Returns the debug call function and its version as an integer (the lowest
+// valid version is 1) or nil and zero.
+func debugCallFunction(bi *BinaryInfo) (*Function, int) {
+	for version := maxDebugCallVersion; version >= 1; version-- {
+		name := debugCallFunctionNamePrefix2 + "V" + strconv.Itoa(version)
+		fn, ok := bi.LookupFunc[name]
+		if ok && fn != nil {
+			return fn, version
+		}
+	}
+	return nil, 0
+}
+
+// debugCallProtocolReg returns the register ID (as defined in pkg/dwarf/regnum)
+// of the register used in the debug call protocol, given the debug call version.
+// Also returns a bool indicating whether the version is supported.
+func debugCallProtocolReg(archName string, version int) (uint64, bool) {
+	switch archName {
+	case "amd64":
+		var protocolReg uint64
+		switch version {
+		case 1:
+			protocolReg = regnum.AMD64_Rax
+		case 2:
+			protocolReg = regnum.AMD64_R12
+		default:
+			return 0, false
+		}
+		return protocolReg, true
+	case "arm64":
+		if version == 2 {
+			return regnum.ARM64_X0 + 20, true
+		}
+		return 0, false
+	default:
+		return 0, false
+	}
+}
+
+type fakeEntry map[dwarf.Attr]interface{}
+
+func (e fakeEntry) Val(attr dwarf.Attr) interface{} {
+	return e[attr]
+}
+
+func regabiMallocgcWorkaround(bi *BinaryInfo) ([]*godwarf.Tree, error) {
+	var err1 error
+
+	t := func(name string) godwarf.Type {
+		if err1 != nil {
+			return nil
+		}
+		typ, err := bi.findType(name)
+		if err != nil {
+			err1 = err
+			return nil
+		}
+		return typ
+	}
+
+	m := func(name string, typ godwarf.Type, reg int, isret bool) *godwarf.Tree {
+		if err1 != nil {
+			return nil
+		}
+		var e fakeEntry = map[dwarf.Attr]interface{}{
+			dwarf.AttrName:     name,
+			dwarf.AttrType:     typ.Common().Offset,
+			dwarf.AttrLocation: []byte{byte(op.DW_OP_reg0) + byte(reg)},
+			dwarf.AttrVarParam: isret,
+		}
+
+		return &godwarf.Tree{
+			Entry: e,
+			Tag:   dwarf.TagFormalParameter,
+		}
+	}
+
+	switch bi.Arch.Name {
+	case "amd64":
+		r := []*godwarf.Tree{
+			m("size", t("uintptr"), regnum.AMD64_Rax, false),
+			m("typ", t("*runtime._type"), regnum.AMD64_Rbx, false),
+			m("needzero", t("bool"), regnum.AMD64_Rcx, false),
+			m("~r1", t("unsafe.Pointer"), regnum.AMD64_Rax, true),
+		}
+		return r, err1
+	case "arm64":
+		r := []*godwarf.Tree{
+			m("size", t("uintptr"), regnum.ARM64_X0, false),
+			m("typ", t("*runtime._type"), regnum.ARM64_X0+1, false),
+			m("needzero", t("bool"), regnum.ARM64_X0+2, false),
+			m("~r1", t("unsafe.Pointer"), regnum.ARM64_X0, true),
+		}
+		return r, err1
+	default:
+		// do nothing
+		return nil, nil
+	}
 }

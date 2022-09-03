@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -24,7 +25,7 @@ func TestIssue554(t *testing.T) {
 	case 8:
 		addr = 0xffffffffffffffff
 	}
-	if mem.contains(uintptr(addr), 40) {
+	if mem.contains(addr, 40) {
 		t.Fatalf("should be false")
 	}
 }
@@ -41,7 +42,7 @@ type memRead struct {
 	size int
 }
 
-func (dm *dummyMem) ReadMemory(buf []byte, addr uintptr) (int, error) {
+func (dm *dummyMem) ReadMemory(buf []byte, addr uint64) (int, error) {
 	dm.t.Logf("read addr=%#x size=%#x\n", addr, len(buf))
 	dm.reads = append(dm.reads, memRead{uint64(addr), len(buf)})
 	a := int64(addr) - int64(dm.base)
@@ -55,7 +56,7 @@ func (dm *dummyMem) ReadMemory(buf []byte, addr uintptr) (int, error) {
 	return len(buf), nil
 }
 
-func (dm *dummyMem) WriteMemory(uintptr, []byte) (int, error) {
+func (dm *dummyMem) WriteMemory(uint64, []byte) (int, error) {
 	panic("not supported")
 }
 
@@ -80,7 +81,7 @@ func TestReadCStringValue(t *testing.T) {
 		t.Logf("base is %#x\n", tc.base)
 		dm.base = tc.base
 		dm.reads = dm.reads[:0]
-		out, done, err := readCStringValue(dm, uintptr(tc.base), LoadConfig{MaxStringLen: maxstrlen})
+		out, done, err := readCStringValue(dm, tc.base, LoadConfig{MaxStringLen: maxstrlen})
 		if err != nil {
 			t.Errorf("base=%#x readCStringValue: %v", tc.base, err)
 		}
@@ -115,6 +116,53 @@ func TestDwarfVersion(t *testing.T) {
 	for _, cu := range bi.Images[0].compileUnits {
 		if cu.Version != 4 {
 			t.Errorf("compile unit %q at %#x has bad version %d", cu.name, cu.entry.Offset, cu.Version)
+		}
+	}
+}
+
+func TestRegabiFlagSentinel(t *testing.T) {
+	// Detect if the regabi flag in the producer string gets removed
+	if !protest.RegabiSupported() {
+		t.Skip("irrelevant before Go 1.17 or on non-amd64 architectures")
+	}
+	fixture := protest.BuildFixture("math", 0)
+	bi := NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
+	assertNoError(bi.LoadBinaryInfo(fixture.Path, 0, nil), t, "LoadBinaryInfo")
+	if !bi.regabi {
+		t.Errorf("regabi flag not set %s GOEXPERIMENT=%s", runtime.Version(), os.Getenv("GOEXPERIMENT"))
+	}
+}
+
+func TestGenericFunctionParser(t *testing.T) {
+	// Normal parsing
+
+	var testCases = []struct{ name, pkg, rcv, base string }{
+		{"github.com/go-delve/delve.afunc", "github.com/go-delve/delve", "", "afunc"},
+		{"github.com/go-delve/delve..afunc", "github.com/go-delve/delve", "", "afunc"}, // malformed
+		{"github.com/go-delve/delve.afunc[some/[thing].el se]", "github.com/go-delve/delve", "", "afunc[some/[thing].el se]"},
+		{"github.com/go-delve/delve.Receiver.afunc", "github.com/go-delve/delve", "Receiver", "afunc"},
+		{"github.com/go-delve/delve.(*Receiver).afunc", "github.com/go-delve/delve", "(*Receiver)", "afunc"},
+		{"github.com/go-delve/delve.Receiver.afunc[some/[thing].el se]", "github.com/go-delve/delve", "Receiver", "afunc[some/[thing].el se]"},       // malformed
+		{"github.com/go-delve/delve.(*Receiver).afunc[some/[thing].el se]", "github.com/go-delve/delve", "(*Receiver)", "afunc[some/[thing].el se]"}, // malformed
+		{"github.com/go-delve/delve.Receiver[some/[thing].el se].afunc", "github.com/go-delve/delve", "Receiver[some/[thing].el se]", "afunc"},
+		{"github.com/go-delve/delve.(*Receiver[some/[thing].el se]).afunc", "github.com/go-delve/delve", "(*Receiver[some/[thing].el se])", "afunc"},
+
+		{"github.com/go-delve/delve.afunc[.some/[thing].el se]", "github.com/go-delve/delve", "", "afunc[.some/[thing].el se]"},
+		{"github.com/go-delve/delve.Receiver.afunc[.some/[thing].el se]", "github.com/go-delve/delve", "Receiver", "afunc[.some/[thing].el se]"}, // malformed
+		{"github.com/go-delve/delve.Receiver[.some/[thing].el se].afunc", "github.com/go-delve/delve", "Receiver[.some/[thing].el se]", "afunc"},
+		{"github.com/go-delve/delve.(*Receiver[.some/[thing].el se]).afunc", "github.com/go-delve/delve", "(*Receiver[.some/[thing].el se])", "afunc"},
+	}
+
+	for _, tc := range testCases {
+		fn := &Function{Name: tc.name}
+		if fn.PackageName() != tc.pkg {
+			t.Errorf("Package name mismatch: %q %q", tc.pkg, fn.PackageName())
+		}
+		if fn.ReceiverName() != tc.rcv {
+			t.Errorf("Receiver name mismatch: %q %q", tc.rcv, fn.ReceiverName())
+		}
+		if fn.BaseName() != tc.base {
+			t.Errorf("Base name mismatch: %q %q", tc.base, fn.BaseName())
 		}
 	}
 }

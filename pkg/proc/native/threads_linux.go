@@ -13,10 +13,10 @@ type waitStatus sys.WaitStatus
 // osSpecificDetails hold Linux specific
 // process details.
 type osSpecificDetails struct {
-	delayedSignal int
-	registers     sys.PtraceRegs
-	running       bool
-	setbp         bool
+	delayedSignal       int
+	running             bool
+	setbp               bool
+	phantomBreakpointPC uint64
 }
 
 func (t *nativeThread) stop() (err error) {
@@ -47,20 +47,44 @@ func (t *nativeThread) resumeWithSig(sig int) (err error) {
 	return
 }
 
-func (t *nativeThread) Blocked() bool {
-	regs, err := t.Registers()
-	if err != nil {
-		return false
+func (t *nativeThread) singleStep() (err error) {
+	sig := 0
+	for {
+		t.dbp.execPtraceFunc(func() { err = ptraceSingleStep(t.ID, sig) })
+		sig = 0
+		if err != nil {
+			return err
+		}
+		wpid, status, err := t.dbp.waitFast(t.ID)
+		if err != nil {
+			return err
+		}
+		if (status == nil || status.Exited()) && wpid == t.dbp.pid {
+			t.dbp.postExit()
+			rs := 0
+			if status != nil {
+				rs = status.ExitStatus()
+			}
+			return proc.ErrProcessExited{Pid: t.dbp.pid, Status: rs}
+		}
+		if wpid == t.ID {
+			switch s := status.StopSignal(); s {
+			case sys.SIGTRAP:
+				return nil
+			case sys.SIGSTOP:
+				// delayed SIGSTOP, ignore it
+			case sys.SIGILL, sys.SIGBUS, sys.SIGFPE, sys.SIGSEGV, sys.SIGSTKFLT:
+				// propagate signals that can have been caused by the current instruction
+				sig = int(s)
+			default:
+				// delay propagation of all other signals
+				t.os.delayedSignal = int(s)
+			}
+		}
 	}
-	pc := regs.PC()
-	fn := t.BinInfo().PCToFunc(pc)
-	if fn != nil && ((fn.Name == "runtime.futex") || (fn.Name == "runtime.usleep") || (fn.Name == "runtime.clone")) {
-		return true
-	}
-	return false
 }
 
-func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (written int, err error) {
+func (t *nativeThread) WriteMemory(addr uint64, data []byte) (written int, err error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
@@ -70,24 +94,29 @@ func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (written int, err 
 	// ProcessVmWrite can't poke read-only memory like ptrace, so don't
 	// even bother for small writes -- likely breakpoints and such.
 	if len(data) > sys.SizeofPtr {
-		written, _ = processVmWrite(t.ID, addr, data)
+		written, _ = processVmWrite(t.ID, uintptr(addr), data)
 	}
 	if written == 0 {
-		t.dbp.execPtraceFunc(func() { written, err = sys.PtracePokeData(t.ID, addr, data) })
+		t.dbp.execPtraceFunc(func() { written, err = sys.PtracePokeData(t.ID, uintptr(addr), data) })
 	}
 	return
 }
 
-func (t *nativeThread) ReadMemory(data []byte, addr uintptr) (n int, err error) {
+func (t *nativeThread) ReadMemory(data []byte, addr uint64) (n int, err error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
 	if len(data) == 0 {
 		return
 	}
-	n, _ = processVmRead(t.ID, addr, data)
+	n, _ = processVmRead(t.ID, uintptr(addr), data)
 	if n == 0 {
-		t.dbp.execPtraceFunc(func() { n, err = sys.PtracePeekData(t.ID, addr, data) })
+		t.dbp.execPtraceFunc(func() { n, err = sys.PtracePeekData(t.ID, uintptr(addr), data) })
 	}
 	return
+}
+
+// SoftExc returns true if this thread received a software exception during the last resume.
+func (t *nativeThread) SoftExc() bool {
+	return t.os.setbp
 }

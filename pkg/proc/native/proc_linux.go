@@ -3,6 +3,7 @@ package native
 import (
 	"bufio"
 	"bytes"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -19,6 +20,7 @@ import (
 	sys "golang.org/x/sys/unix"
 
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 	"github.com/go-delve/delve/pkg/proc/linutil"
 
 	isatty "github.com/mattn/go-isatty"
@@ -36,12 +38,23 @@ const (
 	// version of the kernel ('T' is job control stop on modern 3.x+ kernels) we
 	// may want to differentiate at some point.
 	statusTraceStopT = 'T'
+
+	personalityGetPersonality = 0xffffffff // argument to pass to personality syscall to get the current personality
+	_ADDR_NO_RANDOMIZE        = 0x0040000  // ADDR_NO_RANDOMIZE linux constant
 )
 
 // osProcessDetails contains Linux specific
 // process details.
 type osProcessDetails struct {
 	comm string
+
+	ebpf *ebpf.EBPFContext
+}
+
+func (os *osProcessDetails) Close() {
+	if os.ebpf != nil {
+		os.ebpf.Close()
+	}
 }
 
 // Launch creates and begins debugging a new process. First entry in
@@ -49,11 +62,13 @@ type osProcessDetails struct {
 // to be supplied to that process. `wd` is working directory of the program.
 // If the DWARF information cannot be found in the binary, Delve will look
 // for external debug files in the directories passed in.
-func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string, tty string, redirects [3]string) (*proc.Target, error) {
+func Launch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []string, tty string, redirects [3]string) (*proc.Target, error) {
 	var (
 		process *exec.Cmd
 		err     error
 	)
+
+	foreground := flags&proc.LaunchForeground != 0
 
 	stdin, stdout, stderr, closefn, err := openRedirects(redirects, foreground)
 	if err != nil {
@@ -73,6 +88,15 @@ func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string, tt
 		}
 	}()
 	dbp.execPtraceFunc(func() {
+		if flags&proc.LaunchDisableASLR != 0 {
+			oldPersonality, _, err := syscall.Syscall(sys.SYS_PERSONALITY, personalityGetPersonality, 0, 0)
+			if err == syscall.Errno(0) {
+				newPersonality := oldPersonality | _ADDR_NO_RANDOMIZE
+				syscall.Syscall(sys.SYS_PERSONALITY, newPersonality, 0, 0)
+				defer syscall.Syscall(sys.SYS_PERSONALITY, oldPersonality, 0, 0)
+			}
+		}
+
 		process = exec.Command(cmd[0])
 		process.Args = cmd
 		process.Stdin = stdin
@@ -130,12 +154,7 @@ func Attach(pid int, debugInfoDirs []string) (*proc.Target, error) {
 		return nil, err
 	}
 
-	execPath, err := findExecutable(pid)
-	if err != nil {
-		return nil, err
-	}
-
-	tgt, err := dbp.initialize(execPath, debugInfoDirs)
+	tgt, err := dbp.initialize(findExecutable("", dbp.pid), debugInfoDirs)
 	if err != nil {
 		_ = dbp.Detach(false)
 		return nil, err
@@ -174,25 +193,44 @@ func initialize(dbp *nativeProcess) error {
 		comm = match[1]
 	}
 	dbp.os.comm = strings.ReplaceAll(string(comm), "%", "%%")
+
 	return nil
 }
 
+func (dbp *nativeProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
+	if dbp.os.ebpf == nil {
+		return nil
+	}
+	return dbp.os.ebpf.GetBufferedTracepoints()
+}
+
 // kill kills the target process.
-func (dbp *nativeProcess) kill() (err error) {
+func (dbp *nativeProcess) kill() error {
 	if dbp.exited {
 		return nil
 	}
 	if !dbp.threads[dbp.pid].Stopped() {
 		return errors.New("process must be stopped in order to kill it")
 	}
-	if err = sys.Kill(-dbp.pid, sys.SIGKILL); err != nil {
+	if err := sys.Kill(-dbp.pid, sys.SIGKILL); err != nil {
 		return errors.New("could not deliver signal " + err.Error())
 	}
-	if _, _, err = dbp.wait(dbp.pid, 0); err != nil {
-		return
+	// wait for other threads first or the thread group leader (dbp.pid) will never exit.
+	for threadID := range dbp.threads {
+		if threadID != dbp.pid {
+			dbp.wait(threadID, 0)
+		}
 	}
-	dbp.postExit()
-	return
+	for {
+		wpid, status, err := dbp.wait(dbp.pid, 0)
+		if err != nil {
+			return err
+		}
+		if wpid == dbp.pid && status != nil && status.Signaled() && status.Signal() == sys.SIGKILL {
+			dbp.postExit()
+			return err
+		}
+	}
 }
 
 func (dbp *nativeProcess) requestManualStop() (err error) {
@@ -244,8 +282,16 @@ func (dbp *nativeProcess) addThread(tid int, attach bool) (*nativeThread, error)
 		dbp: dbp,
 		os:  new(osSpecificDetails),
 	}
-	if dbp.currentThread == nil {
-		dbp.currentThread = dbp.threads[tid]
+	if dbp.memthread == nil {
+		dbp.memthread = dbp.threads[tid]
+	}
+	for _, bp := range dbp.Breakpoints().M {
+		if bp.WatchType != 0 {
+			err := dbp.threads[tid].writeHardwareBreakpoint(bp.Addr, bp.WatchType, bp.HWBreakIndex)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	return dbp.threads[tid], nil
 }
@@ -265,9 +311,11 @@ func (dbp *nativeProcess) updateThreadList() error {
 	return linutil.ElfUpdateSharedObjects(dbp)
 }
 
-func findExecutable(pid int) (string, error) {
-	path := fmt.Sprintf("/proc/%d/exe", pid)
-	return filepath.EvalSymlinks(path)
+func findExecutable(path string, pid int) string {
+	if path == "" {
+		path = fmt.Sprintf("/proc/%d/exe", pid)
+	}
+	return path
 }
 
 func (dbp *nativeProcess) trapWait(pid int) (*nativeThread, error) {
@@ -279,6 +327,7 @@ type trapWaitOptions uint8
 const (
 	trapWaitHalt trapWaitOptions = 1 << iota
 	trapWaitNohang
+	trapWaitDontCallExitGuard
 )
 
 func (dbp *nativeProcess) trapWaitInternal(pid int, options trapWaitOptions) (*nativeThread, error) {
@@ -307,6 +356,16 @@ func (dbp *nativeProcess) trapWaitInternal(pid int, options trapWaitOptions) (*n
 				dbp.postExit()
 				return nil, proc.ErrProcessExited{Pid: wpid, Status: status.ExitStatus()}
 			}
+			delete(dbp.threads, wpid)
+			continue
+		}
+		if status.Signaled() {
+			// Signaled means the thread was terminated due to a signal.
+			if wpid == dbp.pid {
+				dbp.postExit()
+				return nil, proc.ErrProcessExited{Pid: wpid, Status: -int(status.Signal())}
+			}
+			// does this ever happen?
 			delete(dbp.threads, wpid)
 			continue
 		}
@@ -374,11 +433,15 @@ func (dbp *nativeProcess) trapWaitInternal(pid int, options trapWaitOptions) (*n
 			th.os.running = false
 			return th, nil
 		} else if err := th.resumeWithSig(int(status.StopSignal())); err != nil {
-			if err == sys.ESRCH {
-				dbp.postExit()
-				return nil, proc.ErrProcessExited{Pid: dbp.pid}
+			if err != sys.ESRCH {
+				return nil, err
 			}
-			return nil, err
+			// do the same thing we do if a thread quit
+			if wpid == dbp.pid {
+				dbp.postExit()
+				return nil, proc.ErrProcessExited{Pid: wpid, Status: status.ExitStatus()}
+			}
+			delete(dbp.threads, wpid)
 		}
 	}
 }
@@ -448,7 +511,7 @@ func (dbp *nativeProcess) exitGuard(err error) error {
 		return err
 	}
 	if status(dbp.pid, dbp.os.comm) == statusZombie {
-		_, err := dbp.trapWaitInternal(-1, 0)
+		_, err := dbp.trapWaitInternal(-1, trapWaitDontCallExitGuard)
 		return err
 	}
 
@@ -475,9 +538,9 @@ func (dbp *nativeProcess) resume() error {
 }
 
 // stop stops all running threads and sets breakpoints
-func (dbp *nativeProcess) stop(trapthread *nativeThread) (err error) {
+func (dbp *nativeProcess) stop(cctx *proc.ContinueOnceContext, trapthread *nativeThread) (*nativeThread, error) {
 	if dbp.exited {
-		return &proc.ErrProcessExited{Pid: dbp.Pid()}
+		return nil, proc.ErrProcessExited{Pid: dbp.pid}
 	}
 
 	for _, th := range dbp.threads {
@@ -489,7 +552,7 @@ func (dbp *nativeProcess) stop(trapthread *nativeThread) (err error) {
 	for {
 		th, err := dbp.trapWaitInternal(-1, trapWaitNohang)
 		if err != nil {
-			return dbp.exitGuard(err)
+			return nil, dbp.exitGuard(err)
 		}
 		if th == nil {
 			break
@@ -500,7 +563,7 @@ func (dbp *nativeProcess) stop(trapthread *nativeThread) (err error) {
 	for _, th := range dbp.threads {
 		if th.os.running {
 			if err := th.stop(); err != nil {
-				return dbp.exitGuard(err)
+				return nil, dbp.exitGuard(err)
 			}
 		}
 	}
@@ -519,23 +582,94 @@ func (dbp *nativeProcess) stop(trapthread *nativeThread) (err error) {
 		}
 		_, err := dbp.trapWaitInternal(-1, trapWaitHalt)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	if err := linutil.ElfUpdateSharedObjects(dbp); err != nil {
-		return err
+		return nil, err
 	}
 
+	switchTrapthread := false
+
 	// set breakpoints on SIGTRAP threads
+	var err1 error
 	for _, th := range dbp.threads {
+		pc, _ := th.PC()
+
+		if !th.os.setbp && pc != th.os.phantomBreakpointPC {
+			// check if this could be a breakpoint hit anyway that the OS hasn't notified us about, yet.
+			if _, ok := dbp.FindBreakpoint(pc, dbp.BinInfo().Arch.BreakInstrMovesPC()); ok {
+				th.os.phantomBreakpointPC = pc
+			}
+		}
+
+		if pc != th.os.phantomBreakpointPC {
+			th.os.phantomBreakpointPC = 0
+		}
+
 		if th.CurrentBreakpoint.Breakpoint == nil && th.os.setbp {
 			if err := th.SetCurrentBreakpoint(true); err != nil {
-				return err
+				err1 = err
+				continue
+			}
+		}
+
+		if th.CurrentBreakpoint.Breakpoint == nil && th.os.setbp && (th.Status != nil) && ((*sys.WaitStatus)(th.Status).StopSignal() == sys.SIGTRAP) && dbp.BinInfo().Arch.BreakInstrMovesPC() {
+			manualStop := false
+			if th.ThreadID() == trapthread.ThreadID() {
+				manualStop = cctx.GetManualStopRequested()
+			}
+			if !manualStop && th.os.phantomBreakpointPC == pc {
+				// Thread received a SIGTRAP but we don't have a breakpoint for it and
+				// it wasn't sent by a manual stop request. It's either a hardcoded
+				// breakpoint or a phantom breakpoint hit (a breakpoint that was hit but
+				// we have removed before we could receive its signal). Check if it is a
+				// hardcoded breakpoint, otherwise rewind the thread.
+				isHardcodedBreakpoint := false
+				pc, _ := th.PC()
+				for _, bpinstr := range [][]byte{
+					dbp.BinInfo().Arch.BreakpointInstruction(),
+					dbp.BinInfo().Arch.AltBreakpointInstruction()} {
+					if bpinstr == nil {
+						continue
+					}
+					buf := make([]byte, len(bpinstr))
+					_, _ = th.ReadMemory(buf, pc-uint64(len(buf)))
+					if bytes.Equal(buf, bpinstr) {
+						isHardcodedBreakpoint = true
+						break
+					}
+				}
+				if !isHardcodedBreakpoint {
+					// phantom breakpoint hit
+					_ = th.setPC(pc - uint64(len(dbp.BinInfo().Arch.BreakpointInstruction())))
+					th.os.setbp = false
+					if trapthread.ThreadID() == th.ThreadID() {
+						// Will switch to a different thread for trapthread because we don't
+						// want pkg/proc to believe that this thread was stopped by a
+						// hardcoded breakpoint.
+						switchTrapthread = true
+					}
+				}
 			}
 		}
 	}
-	return nil
+	if err1 != nil {
+		return nil, err1
+	}
+
+	if switchTrapthread {
+		trapthreadID := trapthread.ID
+		trapthread = nil
+		for _, th := range dbp.threads {
+			if th.os.setbp && th.ThreadID() != trapthreadID {
+				return th, nil
+			}
+		}
+	}
+
+	return trapthread, nil
 }
 
 func (dbp *nativeProcess) detach(kill bool) error {
@@ -568,6 +702,86 @@ func (dbp *nativeProcess) EntryPoint() (uint64, error) {
 	}
 
 	return linutil.EntryPointFromAuxv(auxvbuf, dbp.bi.Arch.PtrSize()), nil
+}
+
+func (dbp *nativeProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf.UProbeArgMap) error {
+	// Lazily load and initialize the BPF program upon request to set a uprobe.
+	if dbp.os.ebpf == nil {
+		var err error
+		dbp.os.ebpf, err = ebpf.LoadEBPFTracingProgram(dbp.bi.Images[0].Path)
+		if err != nil {
+			return err
+		}
+	}
+
+	// We only allow up to 12 args for a BPF probe.
+	// 6 inputs + 6 outputs.
+	// Return early if we have more.
+	if len(args) > 12 {
+		return errors.New("too many arguments in traced function, max is 12 input+return")
+	}
+
+	fn, ok := dbp.bi.LookupFunc[fnName]
+	if !ok {
+		return fmt.Errorf("could not find function: %s", fnName)
+	}
+
+	key := fn.Entry
+	err := dbp.os.ebpf.UpdateArgMap(key, goidOffset, args, dbp.BinInfo().GStructOffset(), false)
+	if err != nil {
+		return err
+	}
+
+	debugname := dbp.bi.Images[0].Path
+
+	// First attach a uprobe at all return addresses. We do this instead of using a uretprobe
+	// for two reasons:
+	// 1. uretprobes do not play well with Go
+	// 2. uretprobes seem to not restore the function return addr on the stack when removed, destroying any
+	//    kind of workaround we could come up with.
+	// TODO(derekparker): this whole thing could likely be optimized a bit.
+	img := dbp.BinInfo().PCToImage(fn.Entry)
+	f, err := elf.Open(img.Path)
+	if err != nil {
+		return fmt.Errorf("could not open elf file to resolve symbol offset: %w", err)
+	}
+
+	var regs proc.Registers
+	mem := dbp.Memory()
+	regs, _ = dbp.memthread.Registers()
+	instructions, err := proc.Disassemble(mem, regs, &proc.BreakpointMap{}, dbp.BinInfo(), fn.Entry, fn.End)
+	if err != nil {
+		return err
+	}
+
+	var addrs []uint64
+	for _, instruction := range instructions {
+		if instruction.IsRet() {
+			addrs = append(addrs, instruction.Loc.PC)
+		}
+	}
+	addrs = append(addrs, proc.FindDeferReturnCalls(instructions)...)
+	for _, addr := range addrs {
+		err := dbp.os.ebpf.UpdateArgMap(addr, goidOffset, args, dbp.BinInfo().GStructOffset(), true)
+		if err != nil {
+			return err
+		}
+		off, err := ebpf.AddressToOffset(f, addr)
+		if err != nil {
+			return err
+		}
+		err = dbp.os.ebpf.AttachUprobe(dbp.pid, debugname, off)
+		if err != nil {
+			return err
+		}
+	}
+
+	off, err := ebpf.AddressToOffset(f, fn.Entry)
+	if err != nil {
+		return err
+	}
+
+	return dbp.os.ebpf.AttachUprobe(dbp.pid, debugname, off)
 }
 
 func killProcess(pid int) error {

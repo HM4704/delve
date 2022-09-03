@@ -1,12 +1,15 @@
 .DEFAULT_GOAL=test
 
+SHELL := /bin/bash
+GO_SRC := $(shell find . -type f -not -path './_fixtures/*' -not -path './vendor/*' -not -path './_scripts/*' -not -path './localtests/*' -name '*.go')
+
 check-cert:
 	@go run _scripts/make.go check-cert
 
-build:
+build: $(GO_SRC)
 	@go run _scripts/make.go build
 
-install:
+install: $(GO_SRC)
 	@go run _scripts/make.go install
 
 uninstall:
@@ -27,4 +30,10 @@ test-integration-run:
 vendor:
 	@go run _scripts/make.go vendor
 
-.PHONY: vendor test-integration-run test-proc-run test check-cert install build vet
+build-ebpf-image:
+	./pkg/proc/internal/ebpf/build/build-ebpf-builder-img.sh
+
+build-ebpf-object: build-ebpf-image
+	./pkg/proc/internal/ebpf/build/build-ebpf-objects.sh
+
+.PHONY: vendor test-integration-run test-proc-run test check-cert install build vet uninstall build-ebpf-image build-ebpf-object

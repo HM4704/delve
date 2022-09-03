@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -20,18 +21,25 @@ const (
 // SinglelineString returns a representation of v on a single line.
 func (v *Variable) SinglelineString() string {
 	var buf bytes.Buffer
-	v.writeTo(&buf, true, false, true, "")
+	v.writeTo(&buf, true, false, true, "", "")
+	return buf.String()
+}
+
+// SinglelineStringFormatted returns a representation of v on a single line, using the format specified by fmtstr.
+func (v *Variable) SinglelineStringFormatted(fmtstr string) string {
+	var buf bytes.Buffer
+	v.writeTo(&buf, true, false, true, "", fmtstr)
 	return buf.String()
 }
 
 // MultilineString returns a representation of v on multiple lines.
-func (v *Variable) MultilineString(indent string) string {
+func (v *Variable) MultilineString(indent, fmtstr string) string {
 	var buf bytes.Buffer
-	v.writeTo(&buf, true, true, true, indent)
+	v.writeTo(&buf, true, true, true, indent, fmtstr)
 	return buf.String()
 }
 
-func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, indent string) {
+func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, indent, fmtstr string) {
 	if v.Unreadable != "" {
 		fmt.Fprintf(buf, "(unreadable %s)", v.Unreadable)
 		return
@@ -48,9 +56,9 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 
 	switch v.Kind {
 	case reflect.Slice:
-		v.writeSliceTo(buf, newlines, includeType, indent)
+		v.writeSliceTo(buf, newlines, includeType, indent, fmtstr)
 	case reflect.Array:
-		v.writeArrayTo(buf, newlines, includeType, indent)
+		v.writeArrayTo(buf, newlines, includeType, indent, fmtstr)
 	case reflect.Ptr:
 		if v.Type == "" || len(v.Children) == 0 {
 			fmt.Fprint(buf, "nil")
@@ -62,7 +70,7 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 			}
 		} else {
 			fmt.Fprint(buf, "*")
-			v.Children[0].writeTo(buf, false, newlines, includeType, indent)
+			v.Children[0].writeTo(buf, false, newlines, includeType, indent, fmtstr)
 		}
 	case reflect.UnsafePointer:
 		if len(v.Children) == 0 {
@@ -70,11 +78,9 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 		} else {
 			fmt.Fprintf(buf, "unsafe.Pointer(%#x)", v.Children[0].Addr)
 		}
-	case reflect.String:
-		v.writeStringTo(buf)
 	case reflect.Chan:
 		if newlines {
-			v.writeStructTo(buf, newlines, includeType, indent)
+			v.writeStructTo(buf, newlines, includeType, indent, fmtstr)
 		} else {
 			if len(v.Children) == 0 {
 				fmt.Fprintf(buf, "%s nil", v.Type)
@@ -83,7 +89,11 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 			}
 		}
 	case reflect.Struct:
-		v.writeStructTo(buf, newlines, includeType, indent)
+		if v.Value != "" {
+			fmt.Fprintf(buf, "%s(%s)", v.Type, v.Value)
+			includeType = false
+		}
+		v.writeStructTo(buf, newlines, includeType, indent, fmtstr)
 	case reflect.Interface:
 		if v.Addr == 0 {
 			// an escaped interface variable that points to nil, this shouldn't
@@ -111,7 +121,7 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 			} else if data.Children[0].OnlyAddr {
 				fmt.Fprintf(buf, "0x%x", v.Children[0].Addr)
 			} else {
-				v.Children[0].writeTo(buf, false, newlines, !includeType, indent)
+				v.Children[0].writeTo(buf, false, newlines, !includeType, indent, fmtstr)
 			}
 		} else if data.OnlyAddr {
 			if strings.Contains(v.Type, "/") {
@@ -120,36 +130,84 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 				fmt.Fprintf(buf, "*(*%s)(%#x)", v.Type, v.Addr)
 			}
 		} else {
-			v.Children[0].writeTo(buf, false, newlines, !includeType, indent)
+			v.Children[0].writeTo(buf, false, newlines, !includeType, indent, fmtstr)
 		}
 	case reflect.Map:
-		v.writeMapTo(buf, newlines, includeType, indent)
+		v.writeMapTo(buf, newlines, includeType, indent, fmtstr)
 	case reflect.Func:
 		if v.Value == "" {
 			fmt.Fprint(buf, "nil")
 		} else {
 			fmt.Fprintf(buf, "%s", v.Value)
 		}
-	case reflect.Complex64, reflect.Complex128:
-		fmt.Fprintf(buf, "(%s + %si)", v.Children[0].Value, v.Children[1].Value)
 	default:
-		if v.Value != "" {
+		v.writeBasicType(buf, fmtstr)
+	}
+}
+
+func (v *Variable) writeBasicType(buf io.Writer, fmtstr string) {
+	if v.Value == "" && v.Kind != reflect.String {
+		fmt.Fprintf(buf, "(unknown %s)", v.Kind)
+		return
+	}
+
+	switch v.Kind {
+	case reflect.Bool:
+		if fmtstr == "" {
 			buf.Write([]byte(v.Value))
-		} else {
-			fmt.Fprintf(buf, "(unknown %s)", v.Kind)
+			return
 		}
+		var b bool = v.Value == "true"
+		fmt.Fprintf(buf, fmtstr, b)
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if fmtstr == "" {
+			buf.Write([]byte(v.Value))
+			return
+		}
+		n, _ := strconv.ParseInt(v.Value, 10, 64)
+		fmt.Fprintf(buf, fmtstr, n)
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if fmtstr == "" {
+			buf.Write([]byte(v.Value))
+			return
+		}
+		n, _ := strconv.ParseUint(v.Value, 10, 64)
+		fmt.Fprintf(buf, fmtstr, n)
+
+	case reflect.Float32, reflect.Float64:
+		if fmtstr == "" {
+			buf.Write([]byte(v.Value))
+			return
+		}
+		x, _ := strconv.ParseFloat(v.Value, 64)
+		fmt.Fprintf(buf, fmtstr, x)
+
+	case reflect.Complex64, reflect.Complex128:
+		if fmtstr == "" {
+			fmt.Fprintf(buf, "(%s + %si)", v.Children[0].Value, v.Children[1].Value)
+			return
+		}
+		real, _ := strconv.ParseFloat(v.Children[0].Value, 64)
+		imag, _ := strconv.ParseFloat(v.Children[1].Value, 64)
+		var x complex128 = complex(real, imag)
+		fmt.Fprintf(buf, fmtstr, x)
+
+	case reflect.String:
+		if fmtstr == "" {
+			s := v.Value
+			if len(s) != int(v.Len) {
+				s = fmt.Sprintf("%s...+%d more", s, int(v.Len)-len(s))
+			}
+			fmt.Fprintf(buf, "%q", s)
+			return
+		}
+		fmt.Fprintf(buf, fmtstr, v.Value)
 	}
 }
 
-func (v *Variable) writeStringTo(buf io.Writer) {
-	s := v.Value
-	if len(s) != int(v.Len) {
-		s = fmt.Sprintf("%s...+%d more", s, int(v.Len)-len(s))
-	}
-	fmt.Fprintf(buf, "%q", s)
-}
-
-func (v *Variable) writeSliceTo(buf io.Writer, newlines, includeType bool, indent string) {
+func (v *Variable) writeSliceTo(buf io.Writer, newlines, includeType bool, indent, fmtstr string) {
 	if includeType {
 		fmt.Fprintf(buf, "%s len: %d, cap: %d, ", v.Type, v.Len, v.Cap)
 	}
@@ -157,17 +215,17 @@ func (v *Variable) writeSliceTo(buf io.Writer, newlines, includeType bool, inden
 		fmt.Fprintf(buf, "nil")
 		return
 	}
-	v.writeSliceOrArrayTo(buf, newlines, indent)
+	v.writeSliceOrArrayTo(buf, newlines, indent, fmtstr)
 }
 
-func (v *Variable) writeArrayTo(buf io.Writer, newlines, includeType bool, indent string) {
+func (v *Variable) writeArrayTo(buf io.Writer, newlines, includeType bool, indent, fmtstr string) {
 	if includeType {
 		fmt.Fprintf(buf, "%s ", v.Type)
 	}
-	v.writeSliceOrArrayTo(buf, newlines, indent)
+	v.writeSliceOrArrayTo(buf, newlines, indent, fmtstr)
 }
 
-func (v *Variable) writeStructTo(buf io.Writer, newlines, includeType bool, indent string) {
+func (v *Variable) writeStructTo(buf io.Writer, newlines, includeType bool, indent, fmtstr string) {
 	if int(v.Len) != len(v.Children) && len(v.Children) == 0 {
 		if strings.Contains(v.Type, "/") {
 			fmt.Fprintf(buf, "(*%q)(%#x)", v.Type, v.Addr)
@@ -190,7 +248,7 @@ func (v *Variable) writeStructTo(buf io.Writer, newlines, includeType bool, inde
 			fmt.Fprintf(buf, "\n%s%s", indent, indentString)
 		}
 		fmt.Fprintf(buf, "%s: ", v.Children[i].Name)
-		v.Children[i].writeTo(buf, false, nl, true, indent+indentString)
+		v.Children[i].writeTo(buf, false, nl, true, indent+indentString, fmtstr)
 		if i != len(v.Children)-1 || nl {
 			fmt.Fprint(buf, ",")
 			if !nl {
@@ -211,7 +269,7 @@ func (v *Variable) writeStructTo(buf io.Writer, newlines, includeType bool, inde
 	fmt.Fprint(buf, "}")
 }
 
-func (v *Variable) writeMapTo(buf io.Writer, newlines, includeType bool, indent string) {
+func (v *Variable) writeMapTo(buf io.Writer, newlines, includeType bool, indent, fmtstr string) {
 	if includeType {
 		fmt.Fprintf(buf, "%s ", v.Type)
 	}
@@ -232,9 +290,9 @@ func (v *Variable) writeMapTo(buf io.Writer, newlines, includeType bool, indent 
 			fmt.Fprintf(buf, "\n%s%s", indent, indentString)
 		}
 
-		key.writeTo(buf, false, false, false, indent+indentString)
+		key.writeTo(buf, false, false, false, indent+indentString, fmtstr)
 		fmt.Fprint(buf, ": ")
-		value.writeTo(buf, false, nl, false, indent+indentString)
+		value.writeTo(buf, false, nl, false, indent+indentString, fmtstr)
 		if i != len(v.Children)-1 || nl {
 			fmt.Fprint(buf, ", ")
 		}
@@ -326,7 +384,7 @@ func (v *Variable) shouldNewlineStruct(newlines bool) bool {
 	return false
 }
 
-func (v *Variable) writeSliceOrArrayTo(buf io.Writer, newlines bool, indent string) {
+func (v *Variable) writeSliceOrArrayTo(buf io.Writer, newlines bool, indent, fmtstr string) {
 	nl := v.shouldNewlineArray(newlines)
 	fmt.Fprint(buf, "[")
 
@@ -334,7 +392,7 @@ func (v *Variable) writeSliceOrArrayTo(buf io.Writer, newlines bool, indent stri
 		if nl {
 			fmt.Fprintf(buf, "\n%s%s", indent, indentString)
 		}
-		v.Children[i].writeTo(buf, false, nl, false, indent+indentString)
+		v.Children[i].writeTo(buf, false, nl, false, indent+indentString, fmtstr)
 		if i != len(v.Children)-1 || nl {
 			fmt.Fprint(buf, ",")
 		}
@@ -360,38 +418,44 @@ func (v *Variable) writeSliceOrArrayTo(buf io.Writer, newlines bool, indent stri
 	fmt.Fprint(buf, "]")
 }
 
-func PrettyExamineMemory(address uintptr, memArea []byte, format byte) string {
+// PrettyExamineMemory examine the memory and format data
+//
+// `format` specifies the data format (or data type), `size` specifies size of each data,
+// like 4byte integer, 1byte character, etc. `count` specifies the number of values.
+func PrettyExamineMemory(address uintptr, memArea []byte, isLittleEndian bool, format byte, size int) string {
 
 	var (
 		cols      int
 		colFormat string
-		addrLen   int
-		addrFmt   string
+		colBytes  = size
+
+		addrLen int
+		addrFmt string
 	)
 
-	// Diffrent versions of golang output differently about '#'.
+	// Different versions of golang output differently about '#'.
 	// See https://ci.appveyor.com/project/derekparker/delve-facy3/builds/30179356.
 	switch format {
 	case 'b':
 		cols = 4 // Avoid emitting rows that are too long when using binary format
-		colFormat = "%08b"
+		colFormat = fmt.Sprintf("%%0%db", colBytes*8)
 	case 'o':
 		cols = 8
-		colFormat = "%04o" // Always keep one leading zero for octal.
+		colFormat = fmt.Sprintf("0%%0%do", colBytes*3) // Always keep one leading zero for octal.
 	case 'd':
 		cols = 8
-		colFormat = "%03d"
+		colFormat = fmt.Sprintf("%%0%dd", colBytes*3)
 	case 'x':
 		cols = 8
-		colFormat = "0x%02x" // Always keep one leading '0x' for hex.
+		colFormat = fmt.Sprintf("0x%%0%dx", colBytes*2) // Always keep one leading '0x' for hex.
 	default:
 		return fmt.Sprintf("not supprted format %q\n", string(format))
 	}
 	colFormat += "\t"
 
 	l := len(memArea)
-	rows := l / cols
-	if l%cols != 0 {
+	rows := l / (cols * colBytes)
+	if l%(cols*colBytes) != 0 {
 		rows++
 	}
 
@@ -403,14 +467,104 @@ func PrettyExamineMemory(address uintptr, memArea []byte, format byte) string {
 
 	var b strings.Builder
 	w := tabwriter.NewWriter(&b, 0, 0, 3, ' ', 0)
+
 	for i := 0; i < rows; i++ {
 		fmt.Fprintf(w, addrFmt, address)
-		for j := 0; j < cols && i*cols+j < l; j++ {
-			fmt.Fprintf(w, colFormat, memArea[i*cols+j])
+
+		for j := 0; j < cols; j++ {
+			offset := i*(cols*colBytes) + j*colBytes
+			if offset+colBytes <= len(memArea) {
+				n := byteArrayToUInt64(memArea[offset:offset+colBytes], isLittleEndian)
+				fmt.Fprintf(w, colFormat, n)
+			}
 		}
 		fmt.Fprintln(w, "")
-		address += uintptr(cols)
+		address += uintptr(cols * colBytes)
 	}
 	w.Flush()
 	return b.String()
+}
+
+func byteArrayToUInt64(buf []byte, isLittleEndian bool) uint64 {
+	var n uint64
+	if isLittleEndian {
+		for i := len(buf) - 1; i >= 0; i-- {
+			n = n<<8 + uint64(buf[i])
+		}
+	} else {
+		for i := 0; i < len(buf); i++ {
+			n = n<<8 + uint64(buf[i])
+		}
+	}
+	return n
+}
+
+const stacktraceTruncatedMessage = "(truncated)"
+
+func digits(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	return int(math.Floor(math.Log10(float64(n)))) + 1
+}
+
+func PrintStack(formatPath func(string) string, out io.Writer, stack []Stackframe, ind string, offsets bool, include func(Stackframe) bool) {
+	if len(stack) == 0 {
+		return
+	}
+
+	extranl := offsets
+	for i := range stack {
+		if extranl {
+			break
+		}
+		extranl = extranl || (len(stack[i].Defers) > 0) || (len(stack[i].Arguments) > 0) || (len(stack[i].Locals) > 0)
+	}
+
+	d := digits(len(stack) - 1)
+	fmtstr := "%s%" + strconv.Itoa(d) + "d  0x%016x in %s\n"
+	s := ind + strings.Repeat(" ", d+2+len(ind))
+
+	for i := range stack {
+		if !include(stack[i]) {
+			continue
+		}
+		if stack[i].Err != "" {
+			fmt.Fprintf(out, "%serror: %s\n", s, stack[i].Err)
+			continue
+		}
+		fmt.Fprintf(out, fmtstr, ind, i, stack[i].PC, stack[i].Function.Name())
+		fmt.Fprintf(out, "%sat %s:%d\n", s, formatPath(stack[i].File), stack[i].Line)
+
+		if offsets {
+			fmt.Fprintf(out, "%sframe: %+#x frame pointer %+#x\n", s, stack[i].FrameOffset, stack[i].FramePointerOffset)
+		}
+
+		for j, d := range stack[i].Defers {
+			deferHeader := fmt.Sprintf("%s    defer %d: ", s, j+1)
+			s2 := strings.Repeat(" ", len(deferHeader))
+			if d.Unreadable != "" {
+				fmt.Fprintf(out, "%s(unreadable defer: %s)\n", deferHeader, d.Unreadable)
+				continue
+			}
+			fmt.Fprintf(out, "%s%#016x in %s\n", deferHeader, d.DeferredLoc.PC, d.DeferredLoc.Function.Name())
+			fmt.Fprintf(out, "%sat %s:%d\n", s2, formatPath(d.DeferredLoc.File), d.DeferredLoc.Line)
+			fmt.Fprintf(out, "%sdeferred by %s at %s:%d\n", s2, d.DeferLoc.Function.Name(), formatPath(d.DeferLoc.File), d.DeferLoc.Line)
+		}
+
+		for j := range stack[i].Arguments {
+			fmt.Fprintf(out, "%s    %s = %s\n", s, stack[i].Arguments[j].Name, stack[i].Arguments[j].SinglelineString())
+		}
+		for j := range stack[i].Locals {
+			fmt.Fprintf(out, "%s    %s = %s\n", s, stack[i].Locals[j].Name, stack[i].Locals[j].SinglelineString())
+		}
+
+		if extranl {
+			fmt.Fprintln(out)
+		}
+	}
+
+	if len(stack) > 0 && !stack[len(stack)-1].Bottom {
+		fmt.Fprintf(out, "%s"+stacktraceTruncatedMessage+"\n", ind)
+	}
 }

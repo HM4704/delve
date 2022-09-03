@@ -1,6 +1,7 @@
 package terminal
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -51,52 +53,28 @@ type FakeTerminal struct {
 const logCommandOutput = false
 
 func (ft *FakeTerminal) Exec(cmdstr string) (outstr string, err error) {
-	outfh, err := ioutil.TempFile("", "cmdtestout")
-	if err != nil {
-		ft.t.Fatalf("could not create temporary file: %v", err)
-	}
-
-	stdout, stderr, termstdout := os.Stdout, os.Stderr, ft.Term.stdout
-	os.Stdout, os.Stderr, ft.Term.stdout = outfh, outfh, outfh
-	defer func() {
-		os.Stdout, os.Stderr, ft.Term.stdout = stdout, stderr, termstdout
-		outfh.Close()
-		outbs, err1 := ioutil.ReadFile(outfh.Name())
-		if err1 != nil {
-			ft.t.Fatalf("could not read temporary output file: %v", err)
-		}
-		outstr = string(outbs)
-		if logCommandOutput {
-			ft.t.Logf("command %q -> %q", cmdstr, outstr)
-		}
-		os.Remove(outfh.Name())
-	}()
+	var buf bytes.Buffer
+	ft.Term.stdout.pw.w = &buf
+	ft.Term.starlarkEnv.Redirect(ft.Term.stdout)
 	err = ft.cmds.Call(cmdstr, ft.Term)
+	outstr = buf.String()
+	if logCommandOutput {
+		ft.t.Logf("command %q -> %q", cmdstr, outstr)
+	}
+	ft.Term.stdout.Flush()
 	return
 }
 
 func (ft *FakeTerminal) ExecStarlark(starlarkProgram string) (outstr string, err error) {
-	outfh, err := ioutil.TempFile("", "cmdtestout")
-	if err != nil {
-		ft.t.Fatalf("could not create temporary file: %v", err)
-	}
-
-	stdout, stderr, termstdout := os.Stdout, os.Stderr, ft.Term.stdout
-	os.Stdout, os.Stderr, ft.Term.stdout = outfh, outfh, outfh
-	defer func() {
-		os.Stdout, os.Stderr, ft.Term.stdout = stdout, stderr, termstdout
-		outfh.Close()
-		outbs, err1 := ioutil.ReadFile(outfh.Name())
-		if err1 != nil {
-			ft.t.Fatalf("could not read temporary output file: %v", err)
-		}
-		outstr = string(outbs)
-		if logCommandOutput {
-			ft.t.Logf("command %q -> %q", starlarkProgram, outstr)
-		}
-		os.Remove(outfh.Name())
-	}()
+	var buf bytes.Buffer
+	ft.Term.stdout.pw.w = &buf
+	ft.Term.starlarkEnv.Redirect(ft.Term.stdout)
 	_, err = ft.Term.starlarkEnv.Execute("<stdin>", starlarkProgram, "main", nil)
+	outstr = buf.String()
+	if logCommandOutput {
+		ft.t.Logf("command %q -> %q", starlarkProgram, outstr)
+	}
+	ft.Term.stdout.Flush()
 	return
 }
 
@@ -177,7 +155,7 @@ func withTestTerminalBuildFlags(name string, t testing.TB, buildFlags test.Build
 func TestCommandDefault(t *testing.T) {
 	var (
 		cmds = Commands{}
-		cmd  = cmds.Find("non-existant-command", noPrefix)
+		cmd  = cmds.Find("non-existent-command", noPrefix).cmdFn
 	)
 
 	err := cmd(nil, callContext{}, "")
@@ -193,7 +171,7 @@ func TestCommandDefault(t *testing.T) {
 func TestCommandReplayWithoutPreviousCommand(t *testing.T) {
 	var (
 		cmds = DebugCommands(nil)
-		cmd  = cmds.Find("", noPrefix)
+		cmd  = cmds.Find("", noPrefix).cmdFn
 		err  = cmd(nil, callContext{}, "")
 	)
 
@@ -205,7 +183,7 @@ func TestCommandReplayWithoutPreviousCommand(t *testing.T) {
 func TestCommandThread(t *testing.T) {
 	var (
 		cmds = DebugCommands(nil)
-		cmd  = cmds.Find("thread", noPrefix)
+		cmd  = cmds.Find("thread", noPrefix).cmdFn
 	)
 
 	err := cmd(nil, callContext{}, "")
@@ -247,16 +225,13 @@ func TestExecuteFile(t *testing.T) {
 }
 
 func TestIssue354(t *testing.T) {
-	printStack(os.Stdout, []api.Stackframe{}, "", false)
-	printStack(os.Stdout, []api.Stackframe{
+	printStack(&Term{}, os.Stdout, []api.Stackframe{}, "", false)
+	printStack(&Term{}, os.Stdout, []api.Stackframe{
 		{Location: api.Location{PC: 0, File: "irrelevant.go", Line: 10, Function: nil},
 			Bottom: true}}, "", false)
 }
 
 func TestIssue411(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
 	test.AllowRecording(t)
 	withTestTerminal("math", t, func(term *FakeTerminal) {
 		term.MustExec("break _fixtures/math.go:8")
@@ -270,9 +245,6 @@ func TestIssue411(t *testing.T) {
 }
 
 func TestTrace(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
 	test.AllowRecording(t)
 	withTestTerminal("issue573", t, func(term *FakeTerminal) {
 		term.MustExec("trace foo")
@@ -289,9 +261,6 @@ func TestTrace(t *testing.T) {
 }
 
 func TestTraceWithName(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
 	test.AllowRecording(t)
 	withTestTerminal("issue573", t, func(term *FakeTerminal) {
 		term.MustExec("trace foobar foo")
@@ -308,9 +277,6 @@ func TestTraceWithName(t *testing.T) {
 }
 
 func TestTraceOnNonFunctionEntry(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
 	test.AllowRecording(t)
 	withTestTerminal("issue573", t, func(term *FakeTerminal) {
 		term.MustExec("trace foobar issue573.go:19")
@@ -342,17 +308,9 @@ func TestScopePrefix(t *testing.T) {
 	const goroutinesCurLinePrefix = "* Goroutine "
 	test.AllowRecording(t)
 
-	tgtAgoroutineCount := 10
-
-	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
-		// We try to make sure that all goroutines are stopped at a sensible place
-		// before reading their stacktrace, but due to the nature of the test
-		// program there is no guarantee that we always find them in a reasonable
-		// state.
-		// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
-		// unnecessary flakiness reduce the target count to 9, allowing one
-		// goroutine to be in a bad state.
-		tgtAgoroutineCount = 9
+	lenient := 0
+	if runtime.GOOS == "windows" {
+		lenient = 1
 	}
 
 	withTestTerminal("goroutinestackprog", t, func(term *FakeTerminal) {
@@ -407,7 +365,7 @@ func TestScopePrefix(t *testing.T) {
 					}
 				}
 			}
-			if len(agoroutines)+extraAgoroutines < tgtAgoroutineCount {
+			if len(agoroutines)+extraAgoroutines < 10-lenient {
 				t.Fatalf("Output of goroutines did not have 10 goroutines stopped on main.agoroutine (%d+%d found): %q", len(agoroutines), extraAgoroutines, goroutinesOut)
 			}
 		}
@@ -421,6 +379,7 @@ func TestScopePrefix(t *testing.T) {
 			stackOut := strings.Split(term.MustExec(fmt.Sprintf("goroutine %d stack", gid)), "\n")
 			fid := -1
 			for _, line := range stackOut {
+				line = strings.TrimLeft(line, " ")
 				space := strings.Index(line, " ")
 				if space < 0 {
 					continue
@@ -436,7 +395,7 @@ func TestScopePrefix(t *testing.T) {
 				}
 			}
 			if fid < 0 {
-				t.Fatalf("Could not find frame for goroutine %d: %v", gid, stackOut)
+				t.Fatalf("Could not find frame for goroutine %d: %q", gid, stackOut)
 			}
 			term.AssertExec(fmt.Sprintf("goroutine     %d    frame     %d     locals", gid, fid), "(no locals)\n")
 			argsOut := strings.Split(term.MustExec(fmt.Sprintf("goroutine %d frame %d args", gid, fid)), "\n")
@@ -451,13 +410,13 @@ func TestScopePrefix(t *testing.T) {
 			seen[ival] = true
 		}
 
-		firsterr := tgtAgoroutineCount != 10
-
 		for i := range seen {
-			if firsterr {
-				firsterr = false
-			} else if !seen[i] {
-				t.Fatalf("goroutine %d not found", i)
+			if !seen[i] {
+				if lenient > 0 {
+					lenient--
+				} else {
+					t.Fatalf("goroutine %d not found", i)
+				}
 			}
 		}
 
@@ -497,14 +456,15 @@ func TestScopePrefix(t *testing.T) {
 }
 
 func TestOnPrefix(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
 	if runtime.GOOS == "freebsd" {
 		t.Skip("test is not valid on FreeBSD")
 	}
 	const prefix = "\ti: "
 	test.AllowRecording(t)
+	lenient := false
+	if runtime.GOOS == "windows" {
+		lenient = true
+	}
 	withTestTerminal("goroutinestackprog", t, func(term *FakeTerminal) {
 		term.MustExec("b agobp main.agoroutine")
 		term.MustExec("on agobp print i")
@@ -536,22 +496,13 @@ func TestOnPrefix(t *testing.T) {
 			}
 		}
 
-		firsterr := false
-		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
-			// We try to make sure that all goroutines are stopped at a sensible place
-			// before reading their stacktrace, but due to the nature of the test
-			// program there is no guarantee that we always find them in a reasonable
-			// state.
-			// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
-			// unnecessary flakiness allow a single goroutine to be in a bad state.
-			firsterr = true
-		}
-
 		for i := range seen {
-			if firsterr {
-				firsterr = false
-			} else if !seen[i] {
-				t.Fatalf("Goroutine %d not seen\n", i)
+			if !seen[i] {
+				if lenient {
+					lenient = false
+				} else {
+					t.Fatalf("Goroutine %d not seen\n", i)
+				}
 			}
 		}
 	})
@@ -569,9 +520,6 @@ func TestNoVars(t *testing.T) {
 }
 
 func TestOnPrefixLocals(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
 	if runtime.GOOS == "freebsd" {
 		t.Skip("test is not valid on FreeBSD")
 	}
@@ -608,21 +556,8 @@ func TestOnPrefixLocals(t *testing.T) {
 			}
 		}
 
-		firsterr := false
-		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
-			// We try to make sure that all goroutines are stopped at a sensible place
-			// before reading their stacktrace, but due to the nature of the test
-			// program there is no guarantee that we always find them in a reasonable
-			// state.
-			// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
-			// unnecessary flakiness allow a single goroutine to be in a bad state.
-			firsterr = true
-		}
-
 		for i := range seen {
-			if firsterr {
-				firsterr = false
-			} else if !seen[i] {
+			if !seen[i] {
 				t.Fatalf("Goroutine %d not seen\n", i)
 			}
 		}
@@ -642,51 +577,8 @@ func countOccurrences(s, needle string) int {
 	return count
 }
 
-func TestIssue387(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
-	// a breakpoint triggering during a 'next' operation will interrupt it
-	test.AllowRecording(t)
-	withTestTerminal("issue387", t, func(term *FakeTerminal) {
-		breakpointHitCount := 0
-		term.MustExec("break dostuff")
-		for {
-			outstr, err := term.Exec("continue")
-			breakpointHitCount += countOccurrences(outstr, "issue387.go:8")
-			t.Log(outstr)
-			if err != nil {
-				if !strings.Contains(err.Error(), "exited") {
-					t.Fatalf("Unexpected error executing 'continue': %v", err)
-				}
-				break
-			}
-
-			pos := 9
-
-			for {
-				outstr = term.MustExec("next")
-				breakpointHitCount += countOccurrences(outstr, "issue387.go:8")
-				t.Log(outstr)
-				if countOccurrences(outstr, fmt.Sprintf("issue387.go:%d", pos)) == 0 {
-					t.Fatalf("did not continue to expected position %d", pos)
-				}
-				pos++
-				if pos >= 11 {
-					break
-				}
-			}
-		}
-		if breakpointHitCount != 10 {
-			t.Fatalf("Breakpoint hit wrong number of times, expected 10 got %d", breakpointHitCount)
-		}
-	})
-}
-
 func listIsAt(t *testing.T, term *FakeTerminal, listcmd string, cur, start, end int) {
+	t.Helper()
 	outstr := term.MustExec(listcmd)
 	lines := strings.Split(outstr, "\n")
 
@@ -731,10 +623,10 @@ func TestListCmd(t *testing.T) {
 	withTestTerminal("testvariables", t, func(term *FakeTerminal) {
 		term.MustExec("continue")
 		term.MustExec("continue")
-		listIsAt(t, term, "list", 25, 20, 30)
-		listIsAt(t, term, "list 69", 69, 64, 70)
-		listIsAt(t, term, "frame 1 list", 62, 57, 67)
-		listIsAt(t, term, "frame 1 list 69", 69, 64, 70)
+		listIsAt(t, term, "list", 27, 22, 32)
+		listIsAt(t, term, "list 69", 69, 64, 74)
+		listIsAt(t, term, "frame 1 list", 66, 61, 71)
+		listIsAt(t, term, "frame 1 list 69", 69, 64, 74)
 		_, err := term.Exec("frame 50 list")
 		if err == nil {
 			t.Fatalf("Expected error requesting 50th frame")
@@ -917,25 +809,6 @@ func TestConfig(t *testing.T) {
 	}
 }
 
-func TestDisassembleAutogenerated(t *testing.T) {
-	// Executing the 'disassemble' command on autogenerated code should work correctly
-
-	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 13) {
-		// CL 161337 in Go 1.13 and later removes the autogenerated init function
-		// https://go-review.googlesource.com/c/go/+/161337
-		t.Skip("no autogenerated init function in Go 1.13 or later")
-	}
-
-	withTestTerminal("math", t, func(term *FakeTerminal) {
-		term.MustExec("break main.init")
-		term.MustExec("continue")
-		out := term.MustExec("disassemble")
-		if !strings.Contains(out, "TEXT main.init(SB) ") {
-			t.Fatalf("output of disassemble wasn't for the main.init function %q", out)
-		}
-	})
-}
-
 func TestIssue1090(t *testing.T) {
 	// Exit while executing 'next' should report the "Process exited" error
 	// message instead of crashing.
@@ -1025,6 +898,7 @@ func TestOptimizationCheck(t *testing.T) {
 }
 
 func TestTruncateStacktrace(t *testing.T) {
+	const stacktraceTruncatedMessage = "(truncated)"
 	withTestTerminal("stacktraceprog", t, func(term *FakeTerminal) {
 		term.MustExec("break main.stacktraceme")
 		term.MustExec("continue")
@@ -1042,9 +916,6 @@ func TestTruncateStacktrace(t *testing.T) {
 }
 
 func TestIssue1493(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support FpRegs for now")
-	}
 	// The 'regs' command without the '-a' option should only return
 	// general purpose registers.
 	withTestTerminal("continuetestprog", t, func(term *FakeTerminal) {
@@ -1065,9 +936,6 @@ func findStarFile(name string) string {
 }
 
 func TestIssue1598(t *testing.T) {
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "386" {
-		t.Skip(fmt.Errorf("%s does not support FunctionCall for now", runtime.GOARCH))
-	}
 	test.MustSupportFunctionCalls(t, testBackend)
 	withTestTerminal("issue1598", t, func(term *FakeTerminal) {
 		term.MustExec("break issue1598.go:5")
@@ -1093,7 +961,7 @@ func TestExamineMemoryCmd(t *testing.T) {
 			t.Fatalf("could convert %s into int64, err %s", addressStr, err)
 		}
 
-		res := term.MustExec("examinemem  -len 52 -fmt hex " + addressStr)
+		res := term.MustExec("examinemem  -count 52 -fmt hex " + addressStr)
 		t.Logf("the result of examining memory \n%s", res)
 		// check first line
 		firstLine := fmt.Sprintf("%#x:   0x0a   0x0b   0x0c   0x0d   0x0e   0x0f   0x10   0x11", address)
@@ -1109,13 +977,73 @@ func TestExamineMemoryCmd(t *testing.T) {
 
 		// second examining memory
 		term.MustExec("continue")
-		res = term.MustExec("x -len 52 -fmt bin " + addressStr)
+		res = term.MustExec("x -count 52 -fmt bin " + addressStr)
 		t.Logf("the second result of examining memory result \n%s", res)
 
 		// check first line
 		firstLine = fmt.Sprintf("%#x:   11111111   00001011   00001100   00001101", address)
 		if !strings.Contains(res, firstLine) {
 			t.Fatalf("expected first line: %s", firstLine)
+		}
+
+		// third examining memory: -x addr
+		res = term.MustExec("examinemem -x " + addressStr)
+		t.Logf("the third result of examining memory result \n%s", res)
+		firstLine = fmt.Sprintf("%#x:   0xff", address)
+		if !strings.Contains(res, firstLine) {
+			t.Fatalf("expected first line: %s", firstLine)
+		}
+
+		// fourth examining memory: -x addr + offset
+		res = term.MustExec("examinemem -x " + addressStr + " + 8")
+		t.Logf("the fourth result of examining memory result \n%s", res)
+		firstLine = fmt.Sprintf("%#x:   0x12", address+8)
+		if !strings.Contains(res, firstLine) {
+			t.Fatalf("expected first line: %s", firstLine)
+		}
+		// fifth examining memory: -x &var
+		res = term.MustExec("examinemem -x &bs[0]")
+		t.Logf("the fifth result of examining memory result \n%s", res)
+		firstLine = fmt.Sprintf("%#x:   0xff", address)
+		if !strings.Contains(res, firstLine) {
+			t.Fatalf("expected first line: %s", firstLine)
+		}
+
+		// sixth examining memory: -fmt and double spaces
+		res = term.MustExec("examinemem -fmt  hex  -x &bs[0]")
+		t.Logf("the sixth result of examining memory result \n%s", res)
+		firstLine = fmt.Sprintf("%#x:   0xff", address)
+		if !strings.Contains(res, firstLine) {
+			t.Fatalf("expected first line: %s", firstLine)
+		}
+	})
+
+	withTestTerminal("testvariables2", t, func(term *FakeTerminal) {
+		tests := []struct {
+			Expr string
+			Want int
+		}{
+			{Expr: "&i1", Want: 1},
+			{Expr: "&i2", Want: 2},
+			{Expr: "p1", Want: 1},
+			{Expr: "*pp1", Want: 1},
+			{Expr: "&str1[1]", Want: '1'},
+			{Expr: "c1.pb", Want: 1},
+			{Expr: "&c1.pb.a", Want: 1},
+			{Expr: "&c1.pb.a.A", Want: 1},
+			{Expr: "&c1.pb.a.B", Want: 2},
+		}
+		term.MustExec("continue")
+		for _, test := range tests {
+			res := term.MustExec("examinemem -fmt dec -x " + test.Expr)
+			// strip addr from output, e.g. "0xc0000160b8:   023" -> "023"
+			res = strings.TrimSpace(strings.Split(res, ":")[1])
+			got, err := strconv.Atoi(res)
+			if err != nil {
+				t.Fatalf("expr=%q err=%s", test.Expr, err)
+			} else if got != test.Want {
+				t.Errorf("expr=%q got=%d want=%d", test.Expr, got, test.Want)
+			}
 		}
 	})
 }
@@ -1184,4 +1112,233 @@ func TestParseNewArgv(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestContinueUntil(t *testing.T) {
+	withTestTerminal("continuetestprog", t, func(term *FakeTerminal) {
+		if runtime.GOARCH != "386" {
+			listIsAt(t, term, "continue main.main", 16, -1, -1)
+		} else {
+			listIsAt(t, term, "continue main.main", 17, -1, -1)
+		}
+		listIsAt(t, term, "continue main.sayhi", 12, -1, -1)
+	})
+}
+
+func TestContinueUntilExistingBreakpoint(t *testing.T) {
+	withTestTerminal("continuetestprog", t, func(term *FakeTerminal) {
+		term.MustExec("break main.main")
+		if runtime.GOARCH != "386" {
+			listIsAt(t, term, "continue main.main", 16, -1, -1)
+		} else {
+			listIsAt(t, term, "continue main.main", 17, -1, -1)
+		}
+		listIsAt(t, term, "continue main.sayhi", 12, -1, -1)
+	})
+}
+
+func TestPrintFormat(t *testing.T) {
+	withTestTerminal("testvariables2", t, func(term *FakeTerminal) {
+		term.MustExec("continue")
+		out := term.MustExec("print %#x m2[1].B")
+		if !strings.Contains(out, "0xb\n") {
+			t.Fatalf("output did not contain '0xb': %q", out)
+		}
+	})
+}
+
+func TestHitCondBreakpoint(t *testing.T) {
+	withTestTerminal("break", t, func(term *FakeTerminal) {
+		term.MustExec("break bp1 main.main:4")
+		term.MustExec("condition -hitcount bp1 > 2")
+		listIsAt(t, term, "continue", 7, -1, -1)
+		out := term.MustExec("print i")
+		t.Logf("%q", out)
+		if !strings.Contains(out, "3\n") {
+			t.Fatalf("wrong value of i")
+		}
+	})
+
+	withTestTerminal("condperghitcount", t, func(term *FakeTerminal) {
+		term.MustExec("break bp1 main.main:8")
+		term.MustExec("condition -per-g-hitcount bp1 == 2")
+		listIsAt(t, term, "continue", 16, -1, -1)
+		// first g hit
+		out := term.MustExec("print j")
+		t.Logf("%q", out)
+		if !strings.Contains(out, "2\n") {
+			t.Fatalf("wrong value of j")
+		}
+		term.MustExec("toggle bp1")
+		listIsAt(t, term, "continue", 16, -1, -1)
+		// second g hit
+		out = term.MustExec("print j")
+		t.Logf("%q", out)
+		if !strings.Contains(out, "2\n") {
+			t.Fatalf("wrong value of j")
+		}
+	})
+}
+
+func TestClearCondBreakpoint(t *testing.T) {
+	withTestTerminal("break", t, func(term *FakeTerminal) {
+		term.MustExec("break main.main:4")
+		term.MustExec("condition 1 i%3==2")
+		listIsAt(t, term, "continue", 7, -1, -1)
+		out := term.MustExec("print i")
+		t.Logf("%q", out)
+		if !strings.Contains(out, "2\n") {
+			t.Fatalf("wrong value of i")
+		}
+		term.MustExec("condition -clear 1")
+		listIsAt(t, term, "continue", 7, -1, -1)
+		out = term.MustExec("print i")
+		t.Logf("%q", out)
+		if !strings.Contains(out, "3\n") {
+			t.Fatalf("wrong value of i")
+		}
+	})
+}
+
+func TestBreakpointEditing(t *testing.T) {
+	term := &FakeTerminal{
+		t:    t,
+		Term: New(nil, &config.Config{}),
+	}
+	_ = term
+
+	var testCases = []struct {
+		inBp    *api.Breakpoint
+		inBpStr string
+		edit    string
+		outBp   *api.Breakpoint
+	}{
+		{ // tracepoint -> breakpoint
+			&api.Breakpoint{Tracepoint: true},
+			"trace",
+			"",
+			&api.Breakpoint{}},
+		{ // breakpoint -> tracepoint
+			&api.Breakpoint{Variables: []string{"a"}},
+			"print a",
+			"print a\ntrace",
+			&api.Breakpoint{Tracepoint: true, Variables: []string{"a"}}},
+		{ // add print var
+			&api.Breakpoint{Variables: []string{"a"}},
+			"print a",
+			"print b\nprint a\n",
+			&api.Breakpoint{Variables: []string{"b", "a"}}},
+		{ // add goroutine flag
+			&api.Breakpoint{},
+			"",
+			"goroutine",
+			&api.Breakpoint{Goroutine: true}},
+		{ // remove goroutine flag
+			&api.Breakpoint{Goroutine: true},
+			"goroutine",
+			"",
+			&api.Breakpoint{}},
+		{ // add stack directive
+			&api.Breakpoint{},
+			"",
+			"stack 10",
+			&api.Breakpoint{Stacktrace: 10}},
+		{ // remove stack directive
+			&api.Breakpoint{Stacktrace: 20},
+			"stack 20",
+			"print a",
+			&api.Breakpoint{Variables: []string{"a"}}},
+		{ // add condition
+			&api.Breakpoint{Variables: []string{"a"}},
+			"print a",
+			"print a\ncond a < b",
+			&api.Breakpoint{Variables: []string{"a"}, Cond: "a < b"}},
+		{ // remove condition
+			&api.Breakpoint{Cond: "a < b"},
+			"cond a < b",
+			"",
+			&api.Breakpoint{}},
+		{ // change condition
+			&api.Breakpoint{Cond: "a < b"},
+			"cond a < b",
+			"cond a < 5",
+			&api.Breakpoint{Cond: "a < 5"}},
+		{ // change hitcount condition
+			&api.Breakpoint{HitCond: "% 2"},
+			"cond -hitcount % 2",
+			"cond -hitcount = 2",
+			&api.Breakpoint{HitCond: "= 2"}},
+	}
+
+	for _, tc := range testCases {
+		bp := *tc.inBp
+		bpStr := strings.Join(formatBreakpointAttrs("", &bp, true), "\n")
+		if bpStr != tc.inBpStr {
+			t.Errorf("Expected %q got %q for:\n%#v", tc.inBpStr, bpStr, tc.inBp)
+		}
+		ctx := callContext{Prefix: onPrefix, Scope: api.EvalScope{GoroutineID: -1, Frame: 0, DeferredCall: 0}, Breakpoint: &bp}
+		err := term.cmds.parseBreakpointAttrs(nil, ctx, strings.NewReader(tc.edit))
+		if err != nil {
+			t.Errorf("Unexpected error during edit %q", tc.edit)
+		}
+		if !reflect.DeepEqual(bp, *tc.outBp) {
+			t.Errorf("mismatch after edit\nexpected: %#v\ngot: %#v", tc.outBp, bp)
+		}
+	}
+}
+
+func TestTranscript(t *testing.T) {
+	withTestTerminal("math", t, func(term *FakeTerminal) {
+		term.MustExec("break main.main")
+		out := term.MustExec("continue")
+		if !strings.HasPrefix(out, "> main.main()") {
+			t.Fatalf("Wrong output for next: <%s>", out)
+		}
+		fh, err := ioutil.TempFile("", "test-transcript-*")
+		if err != nil {
+			t.Fatalf("TempFile: %v", err)
+		}
+		name := fh.Name()
+		fh.Close()
+		t.Logf("output to %q", name)
+
+		slurp := func() string {
+			b, err := ioutil.ReadFile(name)
+			if err != nil {
+				t.Fatalf("could not read transcript file: %v", err)
+			}
+			return string(b)
+		}
+
+		term.MustExec(fmt.Sprintf("transcript %s", name))
+		out = term.MustExec("list")
+		//term.MustExec("transcript -off")
+		if out != slurp() {
+			t.Logf("output of list %s", out)
+			t.Logf("contents of transcript: %s", slurp())
+			t.Errorf("transcript and command out differ")
+		}
+
+		term.MustExec(fmt.Sprintf("transcript -t -x %s", name))
+		out = term.MustExec(`print "hello"`)
+		if out != "" {
+			t.Errorf("output of print is %q but should have been suppressed by transcript", out)
+		}
+		if slurp() != "\"hello\"\n" {
+			t.Errorf("wrong contents of transcript: %q", slurp())
+		}
+
+		os.Remove(name)
+	})
+}
+
+func TestDisassPosCmd(t *testing.T) {
+	withTestTerminal("testvariables2", t, func(term *FakeTerminal) {
+		term.MustExec("continue")
+		out := term.MustExec("step-instruction")
+		t.Logf("%q\n", out)
+		if !strings.Contains(out, "call $runtime.Breakpoint") && !strings.Contains(out, "CALL runtime.Breakpoint(SB)") {
+			t.Errorf("output doesn't look like disassembly")
+		}
+	})
 }

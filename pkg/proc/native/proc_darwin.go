@@ -1,4 +1,5 @@
-//+build darwin,macnative
+//go:build darwin && macnative
+// +build darwin,macnative
 
 package native
 
@@ -18,6 +19,8 @@ import (
 	sys "golang.org/x/sys/unix"
 
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
+	"github.com/go-delve/delve/pkg/proc/macutil"
 )
 
 // osProcessDetails holds Darwin specific information.
@@ -33,11 +36,13 @@ type osProcessDetails struct {
 	portSet C.mach_port_t
 }
 
+func (os *osProcessDetails) Close() {}
+
 // Launch creates and begins debugging a new process. Uses a
 // custom fork/exec process in order to take advantage of
 // PT_SIGEXC on Darwin which will turn Unix signals into
 // Mach exceptions.
-func Launch(cmd []string, wd string, foreground bool, _ []string, _ string, _ [3]string) (*proc.Target, error) {
+func Launch(cmd []string, wd string, flags proc.LaunchFlags, _ []string, _ string, _ [3]string) (*proc.Target, error) {
 	argv0Go, err := filepath.Abs(cmd[0])
 	if err != nil {
 		return nil, err
@@ -49,6 +54,9 @@ func Launch(cmd []string, wd string, foreground bool, _ []string, _ string, _ [3
 		}
 	}
 	if _, err := os.Stat(argv0Go); err != nil {
+		return nil, err
+	}
+	if err := macutil.CheckRosetta(); err != nil {
 		return nil, err
 	}
 
@@ -113,12 +121,12 @@ func Launch(cmd []string, wd string, foreground bool, _ []string, _ string, _ [3
 	if err != nil {
 		return nil, err
 	}
-	if err := dbp.stop(nil); err != nil {
+	if _, err := dbp.stop(nil, nil); err != nil {
 		return nil, err
 	}
 
 	dbp.os.initialized = true
-	dbp.currentThread = trapthread
+	dbp.memthread = trapthread
 
 	tgt, err := dbp.initialize(argv0Go, []string{})
 	if err != nil {
@@ -130,6 +138,9 @@ func Launch(cmd []string, wd string, foreground bool, _ []string, _ string, _ [3
 
 // Attach to an existing process with the given PID.
 func Attach(pid int, _ []string) (*proc.Target, error) {
+	if err := macutil.CheckRosetta(); err != nil {
+		return nil, err
+	}
 	dbp := newProcess(pid)
 
 	kret := C.acquire_mach_task(C.int(pid),
@@ -188,7 +199,7 @@ func (dbp *nativeProcess) kill() (err error) {
 func (dbp *nativeProcess) requestManualStop() (err error) {
 	var (
 		task          = C.mach_port_t(dbp.os.task)
-		thread        = C.mach_port_t(dbp.currentThread.os.threadAct)
+		thread        = C.mach_port_t(dbp.memthread.os.threadAct)
 		exceptionPort = C.mach_port_t(dbp.os.exceptionPort)
 	)
 	dbp.os.halt = true
@@ -267,8 +278,8 @@ func (dbp *nativeProcess) addThread(port int, attach bool) (*nativeThread, error
 	}
 	dbp.threads[port] = thread
 	thread.os.threadAct = C.thread_act_t(port)
-	if dbp.currentThread == nil {
-		dbp.currentThread = thread
+	if dbp.memthread == nil {
+		dbp.memthread = thread
 	}
 	return thread, nil
 }
@@ -307,9 +318,7 @@ func (dbp *nativeProcess) trapWait(pid int) (*nativeThread, error) {
 			return nil, proc.ErrProcessExited{Pid: dbp.pid, Status: status.ExitStatus()}
 
 		case C.MACH_RCV_INTERRUPTED:
-			dbp.stopMu.Lock()
 			halt := dbp.os.halt
-			dbp.stopMu.Unlock()
 			if !halt {
 				// Call trapWait again, it seems
 				// MACH_RCV_INTERRUPTED is emitted before
@@ -338,9 +347,7 @@ func (dbp *nativeProcess) trapWait(pid int) (*nativeThread, error) {
 		dbp.updateThreadList()
 		th, ok := dbp.threads[int(port)]
 		if !ok {
-			dbp.stopMu.Lock()
 			halt := dbp.os.halt
-			dbp.stopMu.Unlock()
 			if halt {
 				dbp.os.halt = false
 				return th, nil
@@ -422,35 +429,35 @@ func (dbp *nativeProcess) resume() error {
 }
 
 // stop stops all running threads and sets breakpoints
-func (dbp *nativeProcess) stop(trapthread *nativeThread) (err error) {
+func (dbp *nativeProcess) stop(cctx *proc.ContinueOnceContext, trapthread *nativeThread) (*nativeThread, error) {
 	if dbp.exited {
-		return &proc.ErrProcessExited{Pid: dbp.Pid()}
+		return nil, proc.ErrProcessExited{Pid: dbp.pid}
 	}
 	for _, th := range dbp.threads {
 		if !th.Stopped() {
 			if err := th.stop(); err != nil {
-				return dbp.exitGuard(err)
+				return nil, dbp.exitGuard(err)
 			}
 		}
 	}
 
 	ports, err := dbp.waitForStop()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !dbp.os.initialized {
-		return nil
+		return nil, nil
 	}
 	trapthread.SetCurrentBreakpoint(true)
 	for _, port := range ports {
 		if th, ok := dbp.threads[port]; ok {
 			err := th.SetCurrentBreakpoint(true)
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
-	return nil
+	return trapthread, nil
 }
 
 func (dbp *nativeProcess) detach(kill bool) error {
@@ -460,6 +467,18 @@ func (dbp *nativeProcess) detach(kill bool) error {
 func (dbp *nativeProcess) EntryPoint() (uint64, error) {
 	//TODO(aarzilli): implement this
 	return 0, nil
+}
+
+func (dbp *nativeProcess) SupportsBPF() bool {
+	return false
+}
+
+func (dbp *nativeProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf.UProbeArgMap) error {
+	panic("not implemented")
+}
+
+func (dbp *nativeProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
+	panic("not implemented")
 }
 
 func initialize(dbp *nativeProcess) error { return nil }

@@ -2,15 +2,15 @@ package native
 
 // #include <sys/thr.h>
 import "C"
+
 import (
 	"fmt"
 	"github.com/go-delve/delve/pkg/proc/fbsdutil"
-	"syscall"
-	"unsafe"
 
 	sys "golang.org/x/sys/unix"
 
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/amd64util"
 )
 
 type waitStatus sys.WaitStatus
@@ -75,59 +75,38 @@ func (t *nativeThread) singleStep() (err error) {
 	return nil
 }
 
-func (t *nativeThread) Blocked() bool {
-	loc, err := t.Location()
-	if err != nil {
-		return false
-	}
-	if loc.Fn != nil && ((loc.Fn.Name == "runtime.futex") || (loc.Fn.Name == "runtime.usleep") || (loc.Fn.Name == "runtime.clone")) {
-		return true
-	}
-	return false
-}
-
 func (t *nativeThread) restoreRegisters(savedRegs proc.Registers) error {
 	sr := savedRegs.(*fbsdutil.AMD64Registers)
-
-	var restoreRegistersErr error
-	t.dbp.execPtraceFunc(func() {
-		restoreRegistersErr = sys.PtraceSetRegs(t.ID, (*sys.Reg)(sr.Regs))
-		if restoreRegistersErr != nil {
-			return
-		}
-		if sr.Fpregset.Xsave != nil {
-			iov := sys.Iovec{Base: &sr.Fpregset.Xsave[0], Len: uint64(len(sr.Fpregset.Xsave))}
-			_, _, restoreRegistersErr = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_SETREGS, uintptr(t.ID), uintptr(unsafe.Pointer(&iov)), 0, 0, 0)
-			return
-		}
-
-		_, _, restoreRegistersErr = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_SETFPREGS, uintptr(t.ID), uintptr(unsafe.Pointer(&sr.Fpregset.AMD64PtraceFpRegs)), 0, 0, 0)
-		return
-	})
-	if restoreRegistersErr == syscall.Errno(0) {
-		restoreRegistersErr = nil
-	}
-	return restoreRegistersErr
+	return setRegisters(t, sr, true)
 }
 
-func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (written int, err error) {
+func (t *nativeThread) WriteMemory(addr uint64, data []byte) (written int, err error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
 	if len(data) == 0 {
 		return 0, nil
 	}
-	t.dbp.execPtraceFunc(func() { written, err = ptraceWriteData(t.ID, addr, data) })
+	t.dbp.execPtraceFunc(func() { written, err = ptraceWriteData(t.ID, uintptr(addr), data) })
 	return written, err
 }
 
-func (t *nativeThread) ReadMemory(data []byte, addr uintptr) (n int, err error) {
+func (t *nativeThread) ReadMemory(data []byte, addr uint64) (n int, err error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
 	if len(data) == 0 {
 		return 0, nil
 	}
-	t.dbp.execPtraceFunc(func() { n, err = ptraceReadData(t.ID, addr, data) })
+	t.dbp.execPtraceFunc(func() { n, err = ptraceReadData(t.ID, uintptr(addr), data) })
 	return n, err
+}
+
+func (t *nativeThread) withDebugRegisters(f func(*amd64util.DebugRegisters) error) error {
+	return proc.ErrHWBreakUnsupported
+}
+
+// SoftExc returns true if this thread received a software exception during the last resume.
+func (t *nativeThread) SoftExc() bool {
+	return false
 }

@@ -10,12 +10,7 @@ import (
 
 	"github.com/go-delve/delve/pkg/dwarf/frame"
 	"github.com/go-delve/delve/pkg/dwarf/op"
-)
-
-const (
-	amd64DwarfIPRegNum uint64 = 16
-	amd64DwarfSPRegNum uint64 = 7
-	amd64DwarfBPRegNum uint64 = 6
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
 )
 
 var amd64BreakInstruction = []byte{0xCC}
@@ -39,6 +34,15 @@ func AMD64Arch(goos string) *Arch {
 		DwarfRegisterToString:            amd64DwarfRegisterToString,
 		inhibitStepInto:                  func(*BinaryInfo, uint64) bool { return false },
 		asmDecode:                        amd64AsmDecode,
+		PCRegNum:                         regnum.AMD64_Rip,
+		SPRegNum:                         regnum.AMD64_Rsp,
+		BPRegNum:                         regnum.AMD64_Rbp,
+		ContextRegNum:                    regnum.AMD64_Rdx,
+		asmRegisters:                     amd64AsmRegisters,
+		RegisterNameToDwarf:              nameToDwarfFunc(regnum.AMD64NameToDwarf),
+		RegnumToString:                   regnum.AMD64ToName,
+		debugCallMinStackSize:            256,
+		maxRegArgBytes:                   9*8 + 15*8,
 	}
 }
 
@@ -68,24 +72,24 @@ func amd64FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *Binary
 		// here).
 
 		return &frame.FrameContext{
-			RetAddrReg: amd64DwarfIPRegNum,
+			RetAddrReg: regnum.AMD64_Rip,
 			Regs: map[uint64]frame.DWRule{
-				amd64DwarfIPRegNum: {
+				regnum.AMD64_Rip: {
 					Rule:   frame.RuleOffset,
 					Offset: int64(-a.PtrSize()),
 				},
-				amd64DwarfBPRegNum: {
+				regnum.AMD64_Rbp: {
 					Rule:   frame.RuleOffset,
 					Offset: int64(-2 * a.PtrSize()),
 				},
-				amd64DwarfSPRegNum: {
+				regnum.AMD64_Rsp: {
 					Rule:   frame.RuleValOffset,
 					Offset: 0,
 				},
 			},
 			CFA: frame.DWRule{
 				Rule:   frame.RuleCFA,
-				Reg:    amd64DwarfBPRegNum,
+				Reg:    regnum.AMD64_Rbp,
 				Offset: int64(2 * a.PtrSize()),
 			},
 		}
@@ -112,10 +116,10 @@ func amd64FixFrameUnwindContext(fctxt *frame.FrameContext, pc uint64, bi *Binary
 	// so that we can use it to unwind the stack even when we encounter frames
 	// without descriptor entries.
 	// If there isn't a rule already we emit one.
-	if fctxt.Regs[amd64DwarfBPRegNum].Rule == frame.RuleUndefined {
-		fctxt.Regs[amd64DwarfBPRegNum] = frame.DWRule{
+	if fctxt.Regs[regnum.AMD64_Rbp].Rule == frame.RuleUndefined {
+		fctxt.Regs[regnum.AMD64_Rbp] = frame.DWRule{
 			Rule:   frame.RuleFramePointer,
-			Reg:    amd64DwarfBPRegNum,
+			Reg:    regnum.AMD64_Rbp,
 			Offset: 0,
 		}
 	}
@@ -130,6 +134,10 @@ const amd64cgocallSPOffsetSaveSlot = 0x28
 
 func amd64SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 	if it.frame.Current.Fn == nil {
+		if it.systemstack && it.g != nil && it.top {
+			it.switchToGoroutineStack()
+			return true
+		}
 		return false
 	}
 	switch it.frame.Current.Fn.Name {
@@ -142,7 +150,7 @@ func amd64SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 		// switches from the goroutine stack to the system stack.
 		// Since we are unwinding the stack from callee to caller we have to switch
 		// from the system stack to the goroutine stack.
-		off, _ := readIntRaw(it.mem, uintptr(it.regs.SP()+amd64cgocallSPOffsetSaveSlot), int64(it.bi.Arch.PtrSize())) // reads "offset of SP from StackHi" from where runtime.asmcgocall saved it
+		off, _ := readIntRaw(it.mem, uint64(it.regs.SP()+amd64cgocallSPOffsetSaveSlot), int64(it.bi.Arch.PtrSize())) // reads "offset of SP from StackHi" from where runtime.asmcgocall saved it
 		oldsp := it.regs.SP()
 		it.regs.Reg(it.regs.SPRegNum).Uint64Val = uint64(int64(it.stackhi) - off)
 
@@ -155,13 +163,13 @@ func amd64SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 
 		// advances to the next frame in the call stack
 		it.frame.addrret = uint64(int64(it.regs.SP()) + int64(it.bi.Arch.PtrSize()))
-		it.frame.Ret, _ = readUintRaw(it.mem, uintptr(it.frame.addrret), int64(it.bi.Arch.PtrSize()))
+		it.frame.Ret, _ = readUintRaw(it.mem, it.frame.addrret, int64(it.bi.Arch.PtrSize()))
 		it.pc = it.frame.Ret
 
 		it.top = false
 		return true
 
-	case "runtime.cgocallback_gofunc":
+	case "runtime.cgocallback_gofunc", "runtime.cgocallback":
 		// For a detailed description of how this works read the long comment at
 		// the start of $GOROOT/src/runtime/cgocall.go and the source code of
 		// runtime.cgocallback_gofunc in $GOROOT/src/runtime/asm_amd64.s
@@ -183,7 +191,7 @@ func amd64SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 		// entering the system stack
 		it.regs.Reg(it.regs.SPRegNum).Uint64Val = it.g0_sched_sp
 		// reads the previous value of g0.sched.sp that runtime.cgocallback_gofunc saved on the stack
-		it.g0_sched_sp, _ = readUintRaw(it.mem, uintptr(it.regs.SP()), int64(it.bi.Arch.PtrSize()))
+		it.g0_sched_sp, _ = readUintRaw(it.mem, uint64(it.regs.SP()), int64(it.bi.Arch.PtrSize()))
 		it.top = false
 		callFrameRegs, ret, retaddr := it.advanceRegs()
 		frameOnSystemStack := it.newStackframe(ret, retaddr)
@@ -218,7 +226,7 @@ func amd64SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 		return true
 
 	default:
-		if it.systemstack && it.top && it.g != nil && strings.HasPrefix(it.frame.Current.Fn.Name, "runtime.") && it.frame.Current.Fn.Name != "runtime.fatalthrow" {
+		if it.systemstack && it.top && it.g != nil && strings.HasPrefix(it.frame.Current.Fn.Name, "runtime.") && it.frame.Current.Fn.Name != "runtime.throw" && it.frame.Current.Fn.Name != "runtime.fatalthrow" {
 			// The runtime switches to the system stack in multiple places.
 			// This usually happens through a call to runtime.systemstack but there
 			// are functions that switch to the system stack manually (for example
@@ -227,7 +235,7 @@ func amd64SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 			// calls we switch directly to the goroutine stack if we detect that the
 			// function at the top of the stack is a runtime function.
 			//
-			// The function "runtime.fatalthrow" is deliberately excluded from this
+			// The function "runtime.throw" is deliberately excluded from this
 			// because it can end up in the stack during a cgo call and switching to
 			// the goroutine stack will exclude all the C functions from the stack
 			// trace.
@@ -244,111 +252,23 @@ func amd64SwitchStack(it *stackIterator, _ *op.DwarfRegisters) bool {
 // in the System V ABI AMD64 Architecture Processor Supplement page 57,
 // figure 3.36
 // https://www.uclibc.org/docs/psABI-x86_64.pdf
-func amd64RegSize(regnum uint64) int {
+func amd64RegSize(rn uint64) int {
 	// XMM registers
-	if regnum > amd64DwarfIPRegNum && regnum <= 32 {
+	if rn > regnum.AMD64_Rip && rn <= 32 {
 		return 16
 	}
 	// x87 registers
-	if regnum >= 33 && regnum <= 40 {
+	if rn >= 33 && rn <= 40 {
 		return 10
 	}
 	return 8
 }
 
-// The mapping between hardware registers and DWARF registers is specified
-// in the System V ABI AMD64 Architecture Processor Supplement page 57,
-// figure 3.36
-// https://www.uclibc.org/docs/psABI-x86_64.pdf
-
-var amd64DwarfToName = map[int]string{
-	0:  "Rax",
-	1:  "Rdx",
-	2:  "Rcx",
-	3:  "Rbx",
-	4:  "Rsi",
-	5:  "Rdi",
-	6:  "Rbp",
-	7:  "Rsp",
-	8:  "R8",
-	9:  "R9",
-	10: "R10",
-	11: "R11",
-	12: "R12",
-	13: "R13",
-	14: "R14",
-	15: "R15",
-	16: "Rip",
-	17: "XMM0",
-	18: "XMM1",
-	19: "XMM2",
-	20: "XMM3",
-	21: "XMM4",
-	22: "XMM5",
-	23: "XMM6",
-	24: "XMM7",
-	25: "XMM8",
-	26: "XMM9",
-	27: "XMM10",
-	28: "XMM11",
-	29: "XMM12",
-	30: "XMM13",
-	31: "XMM14",
-	32: "XMM15",
-	33: "ST(0)",
-	34: "ST(1)",
-	35: "ST(2)",
-	36: "ST(3)",
-	37: "ST(4)",
-	38: "ST(5)",
-	39: "ST(6)",
-	40: "ST(7)",
-	49: "Rflags",
-	50: "Es",
-	51: "Cs",
-	52: "Ss",
-	53: "Ds",
-	54: "Fs",
-	55: "Gs",
-	58: "Fs_base",
-	59: "Gs_base",
-	64: "MXCSR",
-	65: "CW",
-	66: "SW",
-}
-
-var amd64NameToDwarf = func() map[string]int {
-	r := make(map[string]int)
-	for regNum, regName := range amd64DwarfToName {
-		r[strings.ToLower(regName)] = regNum
-	}
-	r["eflags"] = 49
-	r["st0"] = 33
-	r["st1"] = 34
-	r["st2"] = 35
-	r["st3"] = 36
-	r["st4"] = 37
-	r["st5"] = 38
-	r["st6"] = 39
-	r["st7"] = 40
-	return r
-}()
-
-func maxAmd64DwarfRegister() int {
-	max := int(amd64DwarfIPRegNum)
-	for i := range amd64DwarfToName {
-		if i > max {
-			max = i
-		}
-	}
-	return max
-}
-
-func amd64RegistersToDwarfRegisters(staticBase uint64, regs Registers) op.DwarfRegisters {
-	dregs := initDwarfRegistersFromSlice(maxAmd64DwarfRegister(), regs, amd64NameToDwarf)
-	dr := op.NewDwarfRegisters(staticBase, dregs, binary.LittleEndian, amd64DwarfIPRegNum, amd64DwarfSPRegNum, amd64DwarfBPRegNum, 0)
-	dr.SetLoadMoreCallback(loadMoreDwarfRegistersFromSliceFunc(dr, regs, amd64NameToDwarf))
-	return *dr
+func amd64RegistersToDwarfRegisters(staticBase uint64, regs Registers) *op.DwarfRegisters {
+	dregs := initDwarfRegistersFromSlice(int(regnum.AMD64MaxRegNum()), regs, regnum.AMD64NameToDwarf)
+	dr := op.NewDwarfRegisters(staticBase, dregs, binary.LittleEndian, regnum.AMD64_Rip, regnum.AMD64_Rsp, regnum.AMD64_Rbp, 0)
+	dr.SetLoadMoreCallback(loadMoreDwarfRegistersFromSliceFunc(dr, regs, regnum.AMD64NameToDwarf))
+	return dr
 }
 
 func initDwarfRegistersFromSlice(maxRegs int, regs Registers, nameToDwarf map[string]int) []*op.DwarfRegister {
@@ -389,18 +309,19 @@ func loadMoreDwarfRegistersFromSliceFunc(dr *op.DwarfRegisters, regs Registers, 
 }
 
 func amd64AddrAndStackRegsToDwarfRegisters(staticBase, pc, sp, bp, lr uint64) op.DwarfRegisters {
-	dregs := make([]*op.DwarfRegister, amd64DwarfIPRegNum+1)
-	dregs[amd64DwarfIPRegNum] = op.DwarfRegisterFromUint64(pc)
-	dregs[amd64DwarfSPRegNum] = op.DwarfRegisterFromUint64(sp)
-	dregs[amd64DwarfBPRegNum] = op.DwarfRegisterFromUint64(bp)
+	dregs := make([]*op.DwarfRegister, regnum.AMD64_Rip+1)
+	dregs[regnum.AMD64_Rip] = op.DwarfRegisterFromUint64(pc)
+	dregs[regnum.AMD64_Rsp] = op.DwarfRegisterFromUint64(sp)
+	dregs[regnum.AMD64_Rbp] = op.DwarfRegisterFromUint64(bp)
 
-	return *op.NewDwarfRegisters(staticBase, dregs, binary.LittleEndian, amd64DwarfIPRegNum, amd64DwarfSPRegNum, amd64DwarfBPRegNum, 0)
+	return *op.NewDwarfRegisters(staticBase, dregs, binary.LittleEndian, regnum.AMD64_Rip, regnum.AMD64_Rsp, regnum.AMD64_Rbp, 0)
 }
 
 func amd64DwarfRegisterToString(i int, reg *op.DwarfRegister) (name string, floatingPoint bool, repr string) {
-	name, ok := amd64DwarfToName[i]
-	if !ok {
-		name = fmt.Sprintf("unknown%d", i)
+	name = regnum.AMD64ToName(uint64(i))
+
+	if reg == nil {
+		return name, false, ""
 	}
 
 	switch n := strings.ToLower(name); n {

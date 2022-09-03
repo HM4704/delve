@@ -2,15 +2,11 @@ package terminal
 
 import (
 	"fmt"
-	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestStarlarkExamples(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
 	withTestTerminal("testvariables2", t, func(term *FakeTerminal) {
 		term.MustExec("continue")
 		t.Run("goroutine_start_line", func(t *testing.T) { testStarlarkExampleGoroutineStartLine(t, term) })
@@ -127,7 +123,7 @@ func TestStarlarkVariable(t *testing.T) {
 		term.MustExec("continue")
 		for _, tc := range []struct{ expr, tgt string }{
 			{`v = eval(None, "i1").Variable; print(v.Value)`, "1"},
-			{`v = eval(None, "f1").Variable; print(v.Value)`, "3"},
+			{`v = eval(None, "f1").Variable; print(v.Value)`, "3.0"},
 			{`v = eval(None, "as1").Variable; print(v.Value.A)`, "1"},
 			{`v = eval(None, "as1").Variable; print(v.Value.B)`, "1"},
 			{`v = eval(None, "as1").Variable; print(v.Value["A"])`, "1"},

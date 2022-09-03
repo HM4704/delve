@@ -4,7 +4,6 @@ Compile and begin tracing program.
 
 ### Synopsis
 
-
 Trace program execution.
 
 The trace sub command will set a tracepoint on every function matching the
@@ -16,29 +15,32 @@ The output of the trace sub command is printed to stderr, so if you would like t
 only see the output of the trace operations you can redirect stdout.
 
 ```
-dlv trace [package] regexp
+dlv trace [package] regexp [flags]
 ```
 
 ### Options
 
 ```
+      --ebpf            Trace using eBPF (experimental).
   -e, --exec string     Binary file to exec and trace.
+  -h, --help            help for trace
       --output string   Output path for the binary. (default "debug")
   -p, --pid int         Pid to attach to.
-  -s, --stack int       Show stack trace with given depth.
+  -s, --stack int       Show stack trace with given depth. (Ignored with --ebpf)
   -t, --test            Trace a test binary.
 ```
 
 ### Options inherited from parent commands
 
 ```
-      --accept-multiclient               Allows a headless server to accept multiple client connections.
+      --accept-multiclient               Allows a headless server to accept multiple client connections via JSON-RPC or DAP.
       --allow-non-terminal-interactive   Allows interactive sessions of Delve that don't have a terminal as stdin, stdout and stderr
-      --api-version int                  Selects API version when headless. New clients should use v2. Can be reset via RPCServer.SetApiVersion. See Documentation/api/json-rpc/README.md. (default 1)
+      --api-version int                  Selects JSON-RPC API version when headless. New clients should use v2. Can be reset via RPCServer.SetApiVersion. See Documentation/api/json-rpc/README.md. (default 1)
       --backend string                   Backend selection (see 'dlv help backend'). (default "default")
-      --build-flags string               Build flags, to be passed to the compiler.
-      --check-go-version                 Checks that the version of Go in use is compatible with Delve. (default true)
-      --headless                         Run debug server only, in headless mode.
+      --build-flags string               Build flags, to be passed to the compiler. For example: --build-flags="-tags=integration -mod=vendor -cover -v"
+      --check-go-version                 Exits if the version of Go in use is not compatible (too old or too new) with the version of Delve. (default true)
+      --disable-aslr                     Disables address space randomization
+      --headless                         Run debug server only, in headless mode. Server will accept both JSON-RPC or DAP client connections.
       --init string                      Init file, executed by the terminal client.
   -l, --listen string                    Debugging server listen address. (default "127.0.0.1:0")
       --log                              Enable debugging server logging.
@@ -50,5 +52,6 @@ dlv trace [package] regexp
 ```
 
 ### SEE ALSO
+
 * [dlv](dlv.md)	 - Delve is a debugger for the Go programming language.
 

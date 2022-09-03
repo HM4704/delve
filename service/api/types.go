@@ -17,6 +17,8 @@ var ErrNotExecutable = errors.New("not an executable file")
 
 // DebuggerState represents the current context of the debugger.
 type DebuggerState struct {
+	// PID of the process we are debugging.
+	Pid int
 	// Running is true if the process is running and no other information can be collected.
 	Running bool
 	// Recording is true if the process is currently being recorded and no other
@@ -24,6 +26,8 @@ type DebuggerState struct {
 	// sending a StopRecording request will halt the recording, every other
 	// request will block until the process has been recorded.
 	Recording bool
+	// Core dumping currently in progress.
+	CoreDumping bool
 	// CurrentThread is the currently selected debugger thread.
 	CurrentThread *Thread `json:"currentThread,omitempty"`
 	// SelectedGoroutine is the currently selected goroutine
@@ -35,6 +39,9 @@ type DebuggerState struct {
 	// While NextInProgress is set further requests for next or step may be rejected.
 	// Either execute continue until NextInProgress is false or call CancelNext
 	NextInProgress bool
+	// WatchOutOfScope contains the list of watchpoints that went out of scope
+	// during the last continue.
+	WatchOutOfScope []*Breakpoint
 	// Exited indicates whether the debugged process has exited.
 	Exited     bool `json:"exited"`
 	ExitStatus int  `json:"exitStatus"`
@@ -42,6 +49,24 @@ type DebuggerState struct {
 	When string
 	// Filled by RPCClient.Continue, indicates an error
 	Err error `json:"-"`
+}
+
+type TracepointResult struct {
+	// Addr is the address of this tracepoint.
+	Addr uint64 `json:"addr"`
+	// File is the source file for the breakpoint.
+	File string `json:"file"`
+	// Line is a line in File for the breakpoint.
+	Line  int  `json:"line"`
+	IsRet bool `json:"is_ret"`
+	// FunctionName is the name of the function at the current breakpoint, and
+	// may not always be available.
+	FunctionName string `json:"functionName,omitempty"`
+
+	GoroutineID int `json:"goroutineID"`
+
+	InputParams  []Variable `json:"inputParams,omitempty"`
+	ReturnParams []Variable `json:"returnParams,omitempty"`
 }
 
 // Breakpoint addresses a set of locations at which process execution may be
@@ -65,6 +90,11 @@ type Breakpoint struct {
 
 	// Breakpoint condition
 	Cond string
+	// Breakpoint hit count condition.
+	// Supported hit count conditions are "NUMBER" and "OP NUMBER".
+	HitCond string
+	// HitCondPerG use per goroutine hitcount as HitCond operand, instead of total hitcount
+	HitCondPerG bool
 
 	// Tracepoint flag, signifying this is a tracepoint.
 	Tracepoint bool `json:"continue"`
@@ -81,10 +111,21 @@ type Breakpoint struct {
 	LoadArgs *LoadConfig
 	// LoadLocals requests loading function locals when the breakpoint is hit
 	LoadLocals *LoadConfig
+
+	// WatchExpr is the expression used to create this watchpoint
+	WatchExpr string
+	WatchType WatchType
+
+	VerboseDescr []string `json:"VerboseDescr,omitempty"`
+
 	// number of times a breakpoint has been reached in a certain goroutine
 	HitCount map[string]uint64 `json:"hitCount"`
 	// number of times a breakpoint has been reached
 	TotalHitCount uint64 `json:"totalHitCount"`
+	// Disabled flag, signifying the state of the breakpoint
+	Disabled bool `json:"disabled"`
+
+	UserData interface{} `json:"-"`
 }
 
 // ValidBreakpointName returns an error if
@@ -105,6 +146,14 @@ func ValidBreakpointName(name string) error {
 	return nil
 }
 
+// WatchType is the watchpoint type
+type WatchType uint8
+
+const (
+	WatchRead WatchType = 1 << iota
+	WatchWrite
+)
+
 // Thread is a thread within the debugged process.
 type Thread struct {
 	// ID is a unique identifier for the thread.
@@ -119,7 +168,7 @@ type Thread struct {
 	Function *Function `json:"function,omitempty"`
 
 	// ID of the goroutine running on this thread
-	GoroutineID int `json:"goroutineID"`
+	GoroutineID int64 `json:"goroutineID"`
 
 	// Breakpoint this thread is stopped at
 	Breakpoint *Breakpoint `json:"breakPoint,omitempty"`
@@ -128,6 +177,8 @@ type Thread struct {
 
 	// ReturnValues contains the return values of the function we just stepped out of
 	ReturnValues []Variable
+	// CallReturn is true if ReturnValues are the return values of an injected call.
+	CallReturn bool
 }
 
 // Location holds program location information.
@@ -229,10 +280,16 @@ const (
 
 	// VariableFakeAddress means the address of this variable is either fake
 	// (i.e. the variable is partially or completely stored in a CPU register
-	// and doesn't have a real address) or possibly no longer availabe (because
+	// and doesn't have a real address) or possibly no longer available (because
 	// the variable is the return value of a function call and allocated on a
 	// frame that no longer exists)
 	VariableFakeAddress
+
+	// VariableCPtr means the variable is a C pointer
+	VariableCPtr
+
+	// VariableCPURegister means this variable is a CPU register.
+	VariableCPURegister
 )
 
 // Variable describes a variable.
@@ -240,7 +297,7 @@ type Variable struct {
 	// Name of the variable or struct member
 	Name string `json:"name"`
 	// Address of the variable or struct member
-	Addr uintptr `json:"addr"`
+	Addr uint64 `json:"addr"`
 	// Only the address field is filled (result of evaluating expressions like &<expr>)
 	OnlyAddr bool `json:"onlyAddr"`
 	// Go type of the variable
@@ -272,7 +329,7 @@ type Variable struct {
 	// Base address of the backing byte array for strings
 	// address of the struct backing chan and map variables
 	// address of the function entry point for function variables (0 for nil function pointers)
-	Base uintptr `json:"base"`
+	Base uint64 `json:"base"`
 
 	// Unreadable addresses will have this field set
 	Unreadable string `json:"unreadable"`
@@ -301,7 +358,7 @@ type LoadConfig struct {
 // internal G structure.
 type Goroutine struct {
 	// ID is a unique identifier for the goroutine.
-	ID int `json:"id"`
+	ID int64 `json:"id"`
 	// Current location of the goroutine
 	CurrentLoc Location `json:"currentLoc"`
 	// Current location of the goroutine, excluding calls inside runtime
@@ -312,10 +369,18 @@ type Goroutine struct {
 	StartLoc Location `json:"startLoc"`
 	// ID of the associated thread for running goroutines
 	ThreadID   int    `json:"threadID"`
+	Status     uint64 `json:"status"`
+	WaitSince  int64  `json:"waitSince"`
+	WaitReason int64  `json:"waitReason"`
 	Unreadable string `json:"unreadable"`
 	// Goroutine's pprof labels
 	Labels map[string]string `json:"labels,omitempty"`
 }
+
+const (
+	GoroutineWaiting = proc.Gwaiting
+	GoroutineSyscall = proc.Gsyscall
+)
 
 // DebuggerCommand is a command which changes the debugger's execution state.
 type DebuggerCommand struct {
@@ -326,7 +391,7 @@ type DebuggerCommand struct {
 	ThreadID int `json:"threadID,omitempty"`
 	// GoroutineID is used to specify which thread to use with the SwitchGoroutine
 	// and Call commands.
-	GoroutineID int `json:"goroutineID,omitempty"`
+	GoroutineID int64 `json:"goroutineID,omitempty"`
 	// When ReturnInfoLoadConfig is not nil it will be used to load the value
 	// of any return variables.
 	ReturnInfoLoadConfig *LoadConfig
@@ -361,7 +426,7 @@ type BreakpointInfo struct {
 // EvalScope is the scope a command should
 // be evaluated in. Describes the goroutine and frame number.
 type EvalScope struct {
-	GoroutineID  int
+	GoroutineID  int64
 	Frame        int
 	DeferredCall int // when DeferredCall is n > 0 this eval scope is relative to the n-th deferred call in the current frame
 }
@@ -371,7 +436,7 @@ const (
 	Continue = "continue"
 	// Rewind resumes process execution backwards (target must be a recording).
 	Rewind = "rewind"
-	// DirecitonCongruentContinue resumes process execution, if a reverse next, step or stepout operation is in progress it will resume execution backward.
+	// DirectionCongruentContinue resumes process execution, if a reverse next, step or stepout operation is in progress it will resume execution backward.
 	DirectionCongruentContinue = "directionCongruentContinue"
 	// Step continues to next source line, entering function calls.
 	Step = "step"
@@ -394,6 +459,9 @@ const (
 	// SwitchGoroutine switches the debugger's current thread context to the thread running the specified goroutine
 	SwitchGoroutine = "switchGoroutine"
 	// Halt suspends the process.
+	// The effect of Halt while the target process is stopped, or in the
+	// process of stopping, is operating system and timing dependent. It will
+	// either have no effect or cause the following resume to stop immediately.
 	Halt = "halt"
 	// Call resumes process execution injecting a function call.
 	Call = "call"
@@ -528,9 +596,58 @@ const (
 	StacktraceG
 )
 
-// ImportPathToDirectoryPath maps an import path to a directory path.
+// PackageBuildInfo maps an import path to a directory path.
 type PackageBuildInfo struct {
 	ImportPath    string
 	DirectoryPath string
 	Files         []string
+}
+
+// DumpState describes the state of a core dump in progress
+type DumpState struct {
+	Dumping bool
+	AllDone bool
+
+	ThreadsDone, ThreadsTotal int
+	MemDone, MemTotal         uint64
+
+	Err string
+}
+
+// ListGoroutinesFilter describes a filtering condition for the
+// ListGoroutines API call.
+type ListGoroutinesFilter struct {
+	Kind    GoroutineField
+	Negated bool
+	Arg     string
+}
+
+// GoroutineField allows referring to a field of a goroutine object.
+type GoroutineField uint8
+
+const (
+	GoroutineFieldNone  GoroutineField = iota
+	GoroutineCurrentLoc                // the goroutine's CurrentLoc
+	GoroutineUserLoc                   // the goroutine's UserLoc
+	GoroutineGoLoc                     // the goroutine's GoStatementLoc
+	GoroutineStartLoc                  // the goroutine's StartLoc
+	GoroutineLabel                     // the goroutine's label
+	GoroutineRunning                   // the goroutine is running
+	GoroutineUser                      // the goroutine is a user goroutine
+)
+
+// GoroutineGroup represents a group of goroutines in the return value of
+// the ListGoroutines API call.
+type GoroutineGroup struct {
+	Name   string // name of this group
+	Offset int    // start offset in the list of goroutines of this group
+	Count  int    // number of goroutines that belong to this group in the list of goroutines
+	Total  int    // total number of goroutines that belong to this group
+}
+
+type GoroutineGroupingOptions struct {
+	GroupBy         GoroutineField
+	GroupByKey      string
+	MaxGroupMembers int
+	MaxGroups       int
 }

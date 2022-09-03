@@ -12,7 +12,7 @@ import (
 	"github.com/go-delve/delve/service/api"
 )
 
-// Client is a RPC service.Client.
+// RPCClient is a RPC service.Client.
 type RPCClient struct {
 	client *rpc.Client
 
@@ -46,6 +46,12 @@ func (c *RPCClient) ProcessPid() int {
 	out := new(ProcessPidOut)
 	c.call("ProcessPid", ProcessPidIn{}, out)
 	return out.Pid
+}
+
+func (c *RPCClient) BuildID() string {
+	out := new(BuildIDOut)
+	c.call("BuildID", BuildIDIn{}, out)
+	return out.BuildID
 }
 
 func (c *RPCClient) LastModified() time.Time {
@@ -108,6 +114,7 @@ func (c *RPCClient) continueDir(cmd string) <-chan *api.DebuggerState {
 			}
 			if state.Exited {
 				// Error types apparently cannot be marshalled by Go correctly. Must reset error here.
+				//lint:ignore ST1005 backwards compatibility
 				state.Err = fmt.Errorf("Process %d has exited with status %d", c.ProcessPid(), state.ExitStatus)
 			}
 			ch <- &state
@@ -170,7 +177,7 @@ func (c *RPCClient) ReverseStepOut() (*api.DebuggerState, error) {
 	return &out.State, err
 }
 
-func (c *RPCClient) Call(goroutineID int, expr string, unsafe bool) (*api.DebuggerState, error) {
+func (c *RPCClient) Call(goroutineID int64, expr string, unsafe bool) (*api.DebuggerState, error) {
 	var out CommandOut
 	err := c.call("Command", api.DebuggerCommand{Name: api.Call, ReturnInfoLoadConfig: c.retValLoadCfg, Expr: expr, UnsafeCall: unsafe, GoroutineID: goroutineID}, &out)
 	return &out.State, err
@@ -198,7 +205,7 @@ func (c *RPCClient) SwitchThread(threadID int) (*api.DebuggerState, error) {
 	return &out.State, err
 }
 
-func (c *RPCClient) SwitchGoroutine(goroutineID int) (*api.DebuggerState, error) {
+func (c *RPCClient) SwitchGoroutine(goroutineID int64) (*api.DebuggerState, error) {
 	var out CommandOut
 	cmd := api.DebuggerCommand{
 		Name:        api.SwitchGoroutine,
@@ -214,6 +221,12 @@ func (c *RPCClient) Halt() (*api.DebuggerState, error) {
 	return &out.State, err
 }
 
+func (c *RPCClient) GetBufferedTracepoints() ([]api.TracepointResult, error) {
+	var out GetBufferedTracepointsOut
+	err := c.call("GetBufferedTracepoints", GetBufferedTracepointsIn{}, &out)
+	return out.TracepointResults, err
+}
+
 func (c *RPCClient) GetBreakpoint(id int) (*api.Breakpoint, error) {
 	var out GetBreakpointOut
 	err := c.call("GetBreakpoint", GetBreakpointIn{id, ""}, &out)
@@ -226,15 +239,30 @@ func (c *RPCClient) GetBreakpointByName(name string) (*api.Breakpoint, error) {
 	return &out.Breakpoint, err
 }
 
+// CreateBreakpoint will send a request to the RPC server to create a breakpoint.
+// Please refer to the documentation for `Debugger.CreateBreakpoint` for a description of how
+// the requested breakpoint parameters are interpreted and used:
+// https://pkg.go.dev/github.com/go-delve/delve/service/debugger#Debugger.CreateBreakpoint
 func (c *RPCClient) CreateBreakpoint(breakPoint *api.Breakpoint) (*api.Breakpoint, error) {
 	var out CreateBreakpointOut
 	err := c.call("CreateBreakpoint", CreateBreakpointIn{*breakPoint}, &out)
 	return &out.Breakpoint, err
 }
 
-func (c *RPCClient) ListBreakpoints() ([]*api.Breakpoint, error) {
+func (c *RPCClient) CreateEBPFTracepoint(fnName string) error {
+	var out CreateEBPFTracepointOut
+	return c.call("CreateEBPFTracepoint", CreateEBPFTracepointIn{FunctionName: fnName}, &out)
+}
+
+func (c *RPCClient) CreateWatchpoint(scope api.EvalScope, expr string, wtype api.WatchType) (*api.Breakpoint, error) {
+	var out CreateWatchpointOut
+	err := c.call("CreateWatchpoint", CreateWatchpointIn{scope, expr, wtype}, &out)
+	return out.Breakpoint, err
+}
+
+func (c *RPCClient) ListBreakpoints(all bool) ([]*api.Breakpoint, error) {
 	var out ListBreakpointsOut
-	err := c.call("ListBreakpoints", ListBreakpointsIn{}, &out)
+	err := c.call("ListBreakpoints", ListBreakpointsIn{all}, &out)
 	return out.Breakpoints, err
 }
 
@@ -247,6 +275,18 @@ func (c *RPCClient) ClearBreakpoint(id int) (*api.Breakpoint, error) {
 func (c *RPCClient) ClearBreakpointByName(name string) (*api.Breakpoint, error) {
 	var out ClearBreakpointOut
 	err := c.call("ClearBreakpoint", ClearBreakpointIn{0, name}, &out)
+	return out.Breakpoint, err
+}
+
+func (c *RPCClient) ToggleBreakpoint(id int) (*api.Breakpoint, error) {
+	var out ToggleBreakpointOut
+	err := c.call("ToggleBreakpoint", ToggleBreakpointIn{id, ""}, &out)
+	return out.Breakpoint, err
+}
+
+func (c *RPCClient) ToggleBreakpointByName(name string) (*api.Breakpoint, error) {
+	var out ToggleBreakpointOut
+	err := c.call("ToggleBreakpoint", ToggleBreakpointIn{0, name}, &out)
 	return out.Breakpoint, err
 }
 
@@ -334,17 +374,26 @@ func (c *RPCClient) ListFunctionArgs(scope api.EvalScope, cfg api.LoadConfig) ([
 
 func (c *RPCClient) ListGoroutines(start, count int) ([]*api.Goroutine, int, error) {
 	var out ListGoroutinesOut
-	err := c.call("ListGoroutines", ListGoroutinesIn{start, count}, &out)
+	err := c.call("ListGoroutines", ListGoroutinesIn{start, count, nil, api.GoroutineGroupingOptions{}}, &out)
 	return out.Goroutines, out.Nextg, err
 }
 
-func (c *RPCClient) Stacktrace(goroutineId, depth int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error) {
+func (c *RPCClient) ListGoroutinesWithFilter(start, count int, filters []api.ListGoroutinesFilter, group *api.GoroutineGroupingOptions) ([]*api.Goroutine, []api.GoroutineGroup, int, bool, error) {
+	if group == nil {
+		group = &api.GoroutineGroupingOptions{}
+	}
+	var out ListGoroutinesOut
+	err := c.call("ListGoroutines", ListGoroutinesIn{start, count, filters, *group}, &out)
+	return out.Goroutines, out.Groups, out.Nextg, out.TooManyGroups, err
+}
+
+func (c *RPCClient) Stacktrace(goroutineId int64, depth int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error) {
 	var out StacktraceOut
 	err := c.call("Stacktrace", StacktraceIn{goroutineId, depth, false, false, opts, cfg}, &out)
 	return out.Locations, err
 }
 
-func (c *RPCClient) Ancestors(goroutineID int, numAncestors int, depth int) ([]api.Ancestor, error) {
+func (c *RPCClient) Ancestors(goroutineID int64, numAncestors int, depth int) ([]api.Ancestor, error) {
 	var out AncestorsOut
 	err := c.call("Ancestors", AncestorsIn{goroutineID, numAncestors, depth}, &out)
 	return out.Ancestors, err
@@ -356,20 +405,20 @@ func (c *RPCClient) AttachedToExistingProcess() bool {
 	return out.Answer
 }
 
-func (c *RPCClient) FindLocation(scope api.EvalScope, loc string, findInstructions bool) ([]api.Location, error) {
+func (c *RPCClient) FindLocation(scope api.EvalScope, loc string, findInstructions bool, substitutePathRules [][2]string) ([]api.Location, error) {
 	var out FindLocationOut
-	err := c.call("FindLocation", FindLocationIn{scope, loc, !findInstructions}, &out)
+	err := c.call("FindLocation", FindLocationIn{scope, loc, !findInstructions, substitutePathRules}, &out)
 	return out.Locations, err
 }
 
-// Disassemble code between startPC and endPC
+// DisassembleRange disassembles code between startPC and endPC
 func (c *RPCClient) DisassembleRange(scope api.EvalScope, startPC, endPC uint64, flavour api.AssemblyFlavour) (api.AsmInstructions, error) {
 	var out DisassembleOut
 	err := c.call("Disassemble", DisassembleIn{scope, startPC, endPC, flavour}, &out)
 	return out.Disassemble, err
 }
 
-// Disassemble function containing pc
+// DisassemblePC disassembles function containing pc
 func (c *RPCClient) DisassemblePC(scope api.EvalScope, pc uint64, flavour api.AssemblyFlavour) (api.AsmInstructions, error) {
 	var out DisassembleOut
 	err := c.call("Disassemble", DisassembleIn{scope, pc, 0, flavour}, &out)
@@ -441,19 +490,35 @@ func (c *RPCClient) ListDynamicLibraries() ([]api.Image, error) {
 	return out.List, nil
 }
 
-func (c *RPCClient) ExamineMemory(address uintptr, count int) ([]byte, error) {
+func (c *RPCClient) ExamineMemory(address uint64, count int) ([]byte, bool, error) {
 	out := &ExaminedMemoryOut{}
 
 	err := c.call("ExamineMemory", ExamineMemoryIn{Length: count, Address: address}, out)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-
-	return out.Mem, nil
+	return out.Mem, out.IsLittleEndian, nil
 }
 
 func (c *RPCClient) StopRecording() error {
 	return c.call("StopRecording", StopRecordingIn{}, &StopRecordingOut{})
+}
+
+func (c *RPCClient) CoreDumpStart(dest string) (api.DumpState, error) {
+	out := &DumpStartOut{}
+	err := c.call("DumpStart", DumpStartIn{Destination: dest}, out)
+	return out.State, err
+}
+
+func (c *RPCClient) CoreDumpWait(msec int) api.DumpState {
+	out := &DumpWaitOut{}
+	_ = c.call("DumpWait", DumpWaitIn{Wait: msec}, out)
+	return out.State
+}
+
+func (c *RPCClient) CoreDumpCancel() error {
+	out := &DumpCancelOut{}
+	return c.call("DumpCancel", DumpCancelIn{}, out)
 }
 
 func (c *RPCClient) call(method string, args, reply interface{}) error {

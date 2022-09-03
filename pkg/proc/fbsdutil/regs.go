@@ -1,10 +1,12 @@
 package fbsdutil
 
 import (
-	"golang.org/x/arch/x86/x86asm"
+	"fmt"
 
+	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
 	"github.com/go-delve/delve/pkg/proc"
-	"github.com/go-delve/delve/pkg/proc/linutil"
+	"github.com/go-delve/delve/pkg/proc/amd64util"
 )
 
 // AMD64Registers implements the proc.Registers interface for the native/freebsd
@@ -12,7 +14,7 @@ import (
 type AMD64Registers struct {
 	Regs     *AMD64PtraceRegs
 	Fpregs   []proc.Register
-	Fpregset *AMD64Xstate
+	Fpregset *amd64util.AMD64Xstate
 	Fsbase   uint64
 
 	loadFpRegs func(*AMD64Registers) error
@@ -143,6 +145,10 @@ func (r *AMD64Registers) BP() uint64 {
 	return uint64(r.Regs.Rbp)
 }
 
+func (r *AMD64Registers) LR() uint64 {
+	return 0
+}
+
 // TLS returns the address of the thread local storage memory segment.
 func (r *AMD64Registers) TLS() uint64 {
 	return r.Fsbase
@@ -152,164 +158,6 @@ func (r *AMD64Registers) TLS() uint64 {
 // otherwise.
 func (r *AMD64Registers) GAddr() (uint64, bool) {
 	return 0, false
-}
-
-// Get returns the value of the n-th register (in x86asm order).
-func (r *AMD64Registers) Get(n int) (uint64, error) {
-	reg := x86asm.Reg(n)
-	const (
-		mask8  = 0x000000ff
-		mask16 = 0x0000ffff
-		mask32 = 0xffffffff
-	)
-
-	switch reg {
-	// 8-bit
-	case x86asm.AL:
-		return uint64(r.Regs.Rax) & mask8, nil
-	case x86asm.CL:
-		return uint64(r.Regs.Rcx) & mask8, nil
-	case x86asm.DL:
-		return uint64(r.Regs.Rdx) & mask8, nil
-	case x86asm.BL:
-		return uint64(r.Regs.Rbx) & mask8, nil
-	case x86asm.AH:
-		return (uint64(r.Regs.Rax) >> 8) & mask8, nil
-	case x86asm.CH:
-		return (uint64(r.Regs.Rcx) >> 8) & mask8, nil
-	case x86asm.DH:
-		return (uint64(r.Regs.Rdx) >> 8) & mask8, nil
-	case x86asm.BH:
-		return (uint64(r.Regs.Rbx) >> 8) & mask8, nil
-	case x86asm.SPB:
-		return uint64(r.Regs.Rsp) & mask8, nil
-	case x86asm.BPB:
-		return uint64(r.Regs.Rbp) & mask8, nil
-	case x86asm.SIB:
-		return uint64(r.Regs.Rsi) & mask8, nil
-	case x86asm.DIB:
-		return uint64(r.Regs.Rdi) & mask8, nil
-	case x86asm.R8B:
-		return uint64(r.Regs.R8) & mask8, nil
-	case x86asm.R9B:
-		return uint64(r.Regs.R9) & mask8, nil
-	case x86asm.R10B:
-		return uint64(r.Regs.R10) & mask8, nil
-	case x86asm.R11B:
-		return uint64(r.Regs.R11) & mask8, nil
-	case x86asm.R12B:
-		return uint64(r.Regs.R12) & mask8, nil
-	case x86asm.R13B:
-		return uint64(r.Regs.R13) & mask8, nil
-	case x86asm.R14B:
-		return uint64(r.Regs.R14) & mask8, nil
-	case x86asm.R15B:
-		return uint64(r.Regs.R15) & mask8, nil
-
-	// 16-bit
-	case x86asm.AX:
-		return uint64(r.Regs.Rax) & mask16, nil
-	case x86asm.CX:
-		return uint64(r.Regs.Rcx) & mask16, nil
-	case x86asm.DX:
-		return uint64(r.Regs.Rdx) & mask16, nil
-	case x86asm.BX:
-		return uint64(r.Regs.Rbx) & mask16, nil
-	case x86asm.SP:
-		return uint64(r.Regs.Rsp) & mask16, nil
-	case x86asm.BP:
-		return uint64(r.Regs.Rbp) & mask16, nil
-	case x86asm.SI:
-		return uint64(r.Regs.Rsi) & mask16, nil
-	case x86asm.DI:
-		return uint64(r.Regs.Rdi) & mask16, nil
-	case x86asm.R8W:
-		return uint64(r.Regs.R8) & mask16, nil
-	case x86asm.R9W:
-		return uint64(r.Regs.R9) & mask16, nil
-	case x86asm.R10W:
-		return uint64(r.Regs.R10) & mask16, nil
-	case x86asm.R11W:
-		return uint64(r.Regs.R11) & mask16, nil
-	case x86asm.R12W:
-		return uint64(r.Regs.R12) & mask16, nil
-	case x86asm.R13W:
-		return uint64(r.Regs.R13) & mask16, nil
-	case x86asm.R14W:
-		return uint64(r.Regs.R14) & mask16, nil
-	case x86asm.R15W:
-		return uint64(r.Regs.R15) & mask16, nil
-
-	// 32-bit
-	case x86asm.EAX:
-		return uint64(r.Regs.Rax) & mask32, nil
-	case x86asm.ECX:
-		return uint64(r.Regs.Rcx) & mask32, nil
-	case x86asm.EDX:
-		return uint64(r.Regs.Rdx) & mask32, nil
-	case x86asm.EBX:
-		return uint64(r.Regs.Rbx) & mask32, nil
-	case x86asm.ESP:
-		return uint64(r.Regs.Rsp) & mask32, nil
-	case x86asm.EBP:
-		return uint64(r.Regs.Rbp) & mask32, nil
-	case x86asm.ESI:
-		return uint64(r.Regs.Rsi) & mask32, nil
-	case x86asm.EDI:
-		return uint64(r.Regs.Rdi) & mask32, nil
-	case x86asm.R8L:
-		return uint64(r.Regs.R8) & mask32, nil
-	case x86asm.R9L:
-		return uint64(r.Regs.R9) & mask32, nil
-	case x86asm.R10L:
-		return uint64(r.Regs.R10) & mask32, nil
-	case x86asm.R11L:
-		return uint64(r.Regs.R11) & mask32, nil
-	case x86asm.R12L:
-		return uint64(r.Regs.R12) & mask32, nil
-	case x86asm.R13L:
-		return uint64(r.Regs.R13) & mask32, nil
-	case x86asm.R14L:
-		return uint64(r.Regs.R14) & mask32, nil
-	case x86asm.R15L:
-		return uint64(r.Regs.R15) & mask32, nil
-
-	// 64-bit
-	case x86asm.RAX:
-		return uint64(r.Regs.Rax), nil
-	case x86asm.RCX:
-		return uint64(r.Regs.Rcx), nil
-	case x86asm.RDX:
-		return uint64(r.Regs.Rdx), nil
-	case x86asm.RBX:
-		return uint64(r.Regs.Rbx), nil
-	case x86asm.RSP:
-		return uint64(r.Regs.Rsp), nil
-	case x86asm.RBP:
-		return uint64(r.Regs.Rbp), nil
-	case x86asm.RSI:
-		return uint64(r.Regs.Rsi), nil
-	case x86asm.RDI:
-		return uint64(r.Regs.Rdi), nil
-	case x86asm.R8:
-		return uint64(r.Regs.R8), nil
-	case x86asm.R9:
-		return uint64(r.Regs.R9), nil
-	case x86asm.R10:
-		return uint64(r.Regs.R10), nil
-	case x86asm.R11:
-		return uint64(r.Regs.R11), nil
-	case x86asm.R12:
-		return uint64(r.Regs.R12), nil
-	case x86asm.R13:
-		return uint64(r.Regs.R13), nil
-	case x86asm.R14:
-		return uint64(r.Regs.R14), nil
-	case x86asm.R15:
-		return uint64(r.Regs.R15), nil
-	}
-
-	return 0, proc.ErrUnknownRegister
 }
 
 // Copy returns a copy of these registers that is guaranteed not to change.
@@ -323,7 +171,7 @@ func (r *AMD64Registers) Copy() (proc.Registers, error) {
 	}
 	var rr AMD64Registers
 	rr.Regs = &AMD64PtraceRegs{}
-	rr.Fpregset = &AMD64Xstate{}
+	rr.Fpregset = &amd64util.AMD64Xstate{}
 	*(rr.Regs) = *(r.Regs)
 	if r.Fpregset != nil {
 		*(rr.Fpregset) = *(r.Fpregset)
@@ -335,12 +183,70 @@ func (r *AMD64Registers) Copy() (proc.Registers, error) {
 	return &rr, nil
 }
 
-type AMD64Xstate linutil.AMD64Xstate
+func (r *AMD64Registers) SetReg(regNum uint64, reg *op.DwarfRegister) (bool, error) {
+	var p *int64
+	switch regNum {
+	case regnum.AMD64_Rax:
+		p = &r.Regs.Rax
+	case regnum.AMD64_Rbx:
+		p = &r.Regs.Rbx
+	case regnum.AMD64_Rcx:
+		p = &r.Regs.Rcx
+	case regnum.AMD64_Rdx:
+		p = &r.Regs.Rdx
+	case regnum.AMD64_Rsi:
+		p = &r.Regs.Rsi
+	case regnum.AMD64_Rdi:
+		p = &r.Regs.Rdi
+	case regnum.AMD64_Rbp:
+		p = &r.Regs.Rbp
+	case regnum.AMD64_Rsp:
+		p = &r.Regs.Rsp
+	case regnum.AMD64_R8:
+		p = &r.Regs.R8
+	case regnum.AMD64_R9:
+		p = &r.Regs.R9
+	case regnum.AMD64_R10:
+		p = &r.Regs.R10
+	case regnum.AMD64_R11:
+		p = &r.Regs.R11
+	case regnum.AMD64_R12:
+		p = &r.Regs.R12
+	case regnum.AMD64_R13:
+		p = &r.Regs.R13
+	case regnum.AMD64_R14:
+		p = &r.Regs.R14
+	case regnum.AMD64_R15:
+		p = &r.Regs.R15
+	case regnum.AMD64_Rip:
+		p = &r.Regs.Rip
+	case regnum.AMD64_Rflags:
+		p = &r.Regs.Rflags
+	}
 
-func AMD64XstateRead(xstateargs []byte, readLegacy bool, regset *AMD64Xstate) error {
-	return linutil.AMD64XstateRead(xstateargs, readLegacy, (*linutil.AMD64Xstate)(regset))
-}
+	if p != nil {
+		if reg.Bytes != nil && len(reg.Bytes) != 8 {
+			return false, fmt.Errorf("wrong number of bytes for register %s (%d)", regnum.AMD64ToName(regNum), len(reg.Bytes))
+		}
+		*p = int64(reg.Uint64Val)
+		return false, nil
+	}
 
-func (xsave *AMD64Xstate) Decode() (regs []proc.Register) {
-	return (*linutil.AMD64Xstate).Decode((*linutil.AMD64Xstate)(xsave))
+	if r.loadFpRegs != nil {
+		if err := r.loadFpRegs(r); err != nil {
+			return false, err
+		}
+		r.loadFpRegs = nil
+	}
+
+	if regNum < regnum.AMD64_XMM0 || regNum > regnum.AMD64_XMM0+15 {
+		return false, fmt.Errorf("can not set %s", regnum.AMD64ToName(regNum))
+	}
+
+	reg.FillBytes()
+
+	if err := r.Fpregset.SetXmmRegister(int(regNum-regnum.AMD64_XMM0), reg.Bytes); err != nil {
+		return false, err
+	}
+	return true, nil
 }

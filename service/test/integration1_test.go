@@ -716,6 +716,15 @@ func Test1ClientServer_SetVariable(t *testing.T) {
 }
 
 func Test1ClientServer_FullStacktrace(t *testing.T) {
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		t.Skip("cgo doesn't work on darwin/arm64")
+	}
+
+	lenient := false
+	if runtime.GOOS == "windows" {
+		lenient = true
+	}
+
 	withTestClient1("goroutinestackprog", t, func(c *rpc1.RPCClient) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.stacktraceme", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -728,21 +737,22 @@ func Test1ClientServer_FullStacktrace(t *testing.T) {
 		assertNoError(err, t, "GoroutinesInfo()")
 		found := make([]bool, 10)
 		for _, g := range gs {
-			frames, err := c.Stacktrace(g.ID, 10, true)
+			frames, err := c.Stacktrace(int(g.ID), 40, true)
 			assertNoError(err, t, fmt.Sprintf("Stacktrace(%d)", g.ID))
+			t.Logf("goroutine %d", g.ID)
 			for i, frame := range frames {
+				t.Logf("\tframe %d off=%#x bpoff=%#x pc=%#x %s:%d %s", i, frame.FrameOffset, frame.FramePointerOffset, frame.PC, frame.File, frame.Line, frame.Function.Name())
 				if frame.Function == nil {
 					continue
 				}
 				if frame.Function.Name() != "main.agoroutine" {
 					continue
 				}
-				t.Logf("frame %d: %v", i, frame)
 				for _, arg := range frame.Arguments {
 					if arg.Name != "i" {
 						continue
 					}
-					t.Logf("frame %d, variable i is %v\n", i, arg)
+					t.Logf("\tvariable i is %+v\n", arg)
 					argn, err := strconv.Atoi(arg.Value)
 					if err == nil {
 						found[argn] = true
@@ -751,25 +761,17 @@ func Test1ClientServer_FullStacktrace(t *testing.T) {
 			}
 		}
 
-		firsterr := false
-		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
-			// We try to make sure that all goroutines are stopped at a sensible place
-			// before reading their stacktrace, but due to the nature of the test
-			// program there is no guarantee that we always find them in a reasonable
-			// state.
-			// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
-			// unnecessary flakiness allow a single goroutine to be in a bad state.
-			firsterr = true
-		}
 		for i := range found {
 			if !found[i] {
-				if firsterr {
-					firsterr = false
+				if lenient {
+					lenient = false
 				} else {
 					t.Fatalf("Goroutine %d not found", i)
 				}
 			}
 		}
+
+		t.Logf("continue")
 
 		state = <-c.Continue()
 		if state.Err != nil {
@@ -781,10 +783,10 @@ func Test1ClientServer_FullStacktrace(t *testing.T) {
 
 		cur := 3
 		for i, frame := range frames {
+			t.Logf("\tframe %d off=%#x bpoff=%#x pc=%#x %s:%d %s", i, frame.FrameOffset, frame.FramePointerOffset, frame.PC, frame.File, frame.Line, frame.Function.Name())
 			if i == 0 {
 				continue
 			}
-			t.Logf("frame %d: %v", i, frame)
 			v := frame.Var("n")
 			if v == nil {
 				t.Fatalf("Could not find value of variable n in frame %d", i)
@@ -821,18 +823,18 @@ func Test1Issue355(t *testing.T) {
 		state = <-ch
 		assertError(state.Err, t, "Continue()")
 
-		_, err = c.Next()
-		assertError(err, t, "Next()")
-		_, err = c.Step()
-		assertError(err, t, "Step()")
-		_, err = c.StepInstruction()
-		assertError(err, t, "StepInstruction()")
-		_, err = c.SwitchThread(tid)
-		assertError(err, t, "SwitchThread()")
-		_, err = c.SwitchGoroutine(gid)
-		assertError(err, t, "SwitchGoroutine()")
-		_, err = c.Halt()
-		assertError(err, t, "Halt()")
+		s, err := c.Next()
+		assertErrorOrExited(s, err, t, "Next()")
+		s, err = c.Step()
+		assertErrorOrExited(s, err, t, "Step()")
+		s, err = c.StepInstruction()
+		assertErrorOrExited(s, err, t, "StepInstruction()")
+		s, err = c.SwitchThread(tid)
+		assertErrorOrExited(s, err, t, "SwitchThread()")
+		s, err = c.SwitchGoroutine(int(gid))
+		assertErrorOrExited(s, err, t, "SwitchGoroutine()")
+		s, err = c.Halt()
+		assertErrorOrExited(s, err, t, "Halt()")
 		_, err = c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: -1})
 		assertError(err, t, "CreateBreakpoint()")
 		_, err = c.ClearBreakpoint(bp.ID)
@@ -850,7 +852,7 @@ func Test1Issue355(t *testing.T) {
 		assertError(err, t, "ListRegisters()")
 		_, err = c.ListGoroutines()
 		assertError(err, t, "ListGoroutines()")
-		_, err = c.Stacktrace(gid, 10, false)
+		_, err = c.Stacktrace(int(gid), 10, false)
 		assertError(err, t, "Stacktrace()")
 		_, err = c.FindLocation(api.EvalScope{GoroutineID: gid}, "+1")
 		assertError(err, t, "FindLocation()")
@@ -1069,7 +1071,7 @@ func Test1Issue406(t *testing.T) {
 		assertNoError(state.Err, t, "Continue()")
 		v, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "cfgtree")
 		assertNoError(err, t, "EvalVariable()")
-		vs := v.MultilineString("")
+		vs := v.MultilineString("", "")
 		t.Logf("cfgtree formats to: %s\n", vs)
 	})
 }

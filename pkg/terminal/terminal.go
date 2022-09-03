@@ -1,19 +1,23 @@
 package terminal
 
+//lint:file-ignore ST1005 errors here can be capitalized
+
 import (
 	"fmt"
 	"io"
 	"net/rpc"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 
-	"github.com/peterh/liner"
+	"github.com/derekparker/trie"
+	"github.com/go-delve/liner"
 
 	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/locspec"
+	"github.com/go-delve/delve/pkg/terminal/colorize"
 	"github.com/go-delve/delve/pkg/terminal/starbind"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
@@ -51,21 +55,32 @@ type Term struct {
 	prompt   string
 	line     *liner.State
 	cmds     *Commands
-	dumb     bool
-	stdout   io.Writer
+	stdout   *transcriptWriter
 	InitFile string
-	displays []string
+	displays []displayEntry
 
 	historyFile *os.File
 
 	starlarkEnv *starbind.Env
 
+	substitutePathRulesCache [][2]string
+
 	// quitContinue is set to true by exitCommand to signal that the process
 	// should be resumed before quitting.
 	quitContinue bool
 
+	longCommandMu         sync.Mutex
+	longCommandCancelFlag bool
+
 	quittingMutex sync.Mutex
 	quitting      bool
+
+	traceNonInteractive bool
+}
+
+type displayEntry struct {
+	expr   string
+	fmtstr string
 }
 
 // New returns a new Term.
@@ -79,30 +94,42 @@ func New(client service.Client, conf *config.Config) *Term {
 		conf = &config.Config{}
 	}
 
-	var w io.Writer
-
-	dumb := strings.ToLower(os.Getenv("TERM")) == "dumb"
-	if dumb {
-		w = os.Stdout
-	} else {
-		w = getColorableWriter()
-	}
-
-	if (conf.SourceListLineColor > ansiWhite &&
-		conf.SourceListLineColor < ansiBrBlack) ||
-		conf.SourceListLineColor < ansiBlack ||
-		conf.SourceListLineColor > ansiBrWhite {
-		conf.SourceListLineColor = ansiBlue
-	}
-
 	t := &Term{
 		client: client,
 		conf:   conf,
 		prompt: "(dlv) ",
 		line:   liner.NewLiner(),
 		cmds:   cmds,
-		dumb:   dumb,
-		stdout: w,
+		stdout: &transcriptWriter{pw: &pagingWriter{w: os.Stdout}},
+	}
+	t.line.SetCtrlZStop(true)
+
+	if strings.ToLower(os.Getenv("TERM")) != "dumb" {
+		t.stdout.pw = &pagingWriter{w: getColorableWriter()}
+		t.stdout.colorEscapes = make(map[colorize.Style]string)
+		t.stdout.colorEscapes[colorize.NormalStyle] = terminalResetEscapeCode
+		wd := func(s string, defaultCode int) string {
+			if s == "" {
+				return fmt.Sprintf(terminalHighlightEscapeCode, defaultCode)
+			}
+			return s
+		}
+		t.stdout.colorEscapes[colorize.KeywordStyle] = conf.SourceListKeywordColor
+		t.stdout.colorEscapes[colorize.StringStyle] = wd(conf.SourceListStringColor, ansiGreen)
+		t.stdout.colorEscapes[colorize.NumberStyle] = conf.SourceListNumberColor
+		t.stdout.colorEscapes[colorize.CommentStyle] = wd(conf.SourceListCommentColor, ansiBrMagenta)
+		t.stdout.colorEscapes[colorize.ArrowStyle] = wd(conf.SourceListArrowColor, ansiYellow)
+		switch x := conf.SourceListLineColor.(type) {
+		case string:
+			t.stdout.colorEscapes[colorize.LineNoStyle] = x
+		case int:
+			if (x > ansiWhite && x < ansiBrBlack) || x < ansiBlack || x > ansiBrWhite {
+				x = ansiBlue
+			}
+			t.stdout.colorEscapes[colorize.LineNoStyle] = fmt.Sprintf(terminalHighlightEscapeCode, x)
+		case nil:
+			t.stdout.colorEscapes[colorize.LineNoStyle] = fmt.Sprintf(terminalHighlightEscapeCode, ansiBlue)
+		}
 	}
 
 	if client != nil {
@@ -110,22 +137,42 @@ func New(client service.Client, conf *config.Config) *Term {
 		client.SetReturnValuesLoadConfig(&lcfg)
 	}
 
-	t.starlarkEnv = starbind.New(starlarkContext{t})
+	t.starlarkEnv = starbind.New(starlarkContext{t}, t.stdout)
 	return t
+}
+
+func (t *Term) SetTraceNonInteractive() {
+	t.traceNonInteractive = true
+}
+
+func (t *Term) IsTraceNonInteractive() bool {
+	return t.traceNonInteractive
 }
 
 // Close returns the terminal to its previous mode.
 func (t *Term) Close() {
 	t.line.Close()
+	if err := t.stdout.CloseTranscript(); err != nil {
+		fmt.Fprintf(os.Stderr, "error closing transcript file: %v\n", err)
+	}
 }
 
 func (t *Term) sigintGuard(ch <-chan os.Signal, multiClient bool) {
 	for range ch {
+		t.longCommandCancel()
 		t.starlarkEnv.Cancel()
 		state, err := t.client.GetStateNonBlocking()
 		if err == nil && state.Recording {
-			fmt.Printf("received SIGINT, stopping recording (will not forward signal)\n")
+			fmt.Fprintf(t.stdout, "received SIGINT, stopping recording (will not forward signal)\n")
 			err := t.client.StopRecording()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+			}
+			continue
+		}
+		if err == nil && state.CoreDumping {
+			fmt.Fprintf(t.stdout, "received SIGINT, stopping dump\n")
+			err := t.client.CoreDumpCancel()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 			}
@@ -155,14 +202,14 @@ func (t *Term) sigintGuard(ch <-chan os.Signal, multiClient bool) {
 					t.Close()
 				}
 			default:
-				fmt.Println("only p or q allowed")
+				fmt.Fprintln(t.stdout, "only p or q allowed")
 			}
 
 		} else {
-			fmt.Printf("received SIGINT, stopping process (will not forward signal)\n")
+			fmt.Fprintf(t.stdout, "received SIGINT, stopping process (will not forward signal)\n")
 			_, err := t.client.Halt()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%v", err)
+				fmt.Fprintf(t.stdout, "%v", err)
 			}
 		}
 	}
@@ -179,19 +226,56 @@ func (t *Term) Run() (int, error) {
 	signal.Notify(ch, syscall.SIGINT)
 	go t.sigintGuard(ch, multiClient)
 
-	t.line.SetCompleter(func(line string) (c []string) {
-		if strings.HasPrefix(line, "break ") || strings.HasPrefix(line, "b ") {
-			filter := line[strings.Index(line, " ")+1:]
-			funcs, _ := t.client.ListFunctions(filter)
-			for _, f := range funcs {
-				c = append(c, "break "+f)
-			}
-			return
+	fns := trie.New()
+	cmds := trie.New()
+	funcs, _ := t.client.ListFunctions("")
+	for _, fn := range funcs {
+		fns.Add(fn, nil)
+	}
+	for _, cmd := range t.cmds.cmds {
+		for _, alias := range cmd.aliases {
+			cmds.Add(alias, nil)
 		}
-		for _, cmd := range t.cmds.cmds {
-			for _, alias := range cmd.aliases {
-				if strings.HasPrefix(alias, strings.ToLower(line)) {
-					c = append(c, alias)
+	}
+
+	var locs *trie.Trie
+
+	t.line.SetCompleter(func(line string) (c []string) {
+		cmd := t.cmds.Find(strings.Split(line, " ")[0], noPrefix)
+		switch cmd.aliases[0] {
+		case "break", "trace", "continue":
+			if spc := strings.LastIndex(line, " "); spc > 0 {
+				prefix := line[:spc] + " "
+				funcs := fns.FuzzySearch(line[spc+1:])
+				for _, f := range funcs {
+					c = append(c, prefix+f)
+				}
+			}
+		case "nullcmd", "nocmd":
+			commands := cmds.FuzzySearch(strings.ToLower(line))
+			c = append(c, commands...)
+		case "print", "whatis":
+			if locs == nil {
+				localVars, err := t.client.ListLocalVariables(
+					api.EvalScope{GoroutineID: -1, Frame: t.cmds.frame, DeferredCall: 0},
+					api.LoadConfig{},
+				)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Unable to get local variables: %s\n", err)
+					break
+				}
+
+				locs = trie.New()
+				for _, loc := range localVars {
+					locs.Add(loc.Name, nil)
+				}
+			}
+
+			if spc := strings.LastIndex(line, " "); spc > 0 {
+				prefix := line[:spc] + " "
+				locals := locs.FuzzySearch(line[spc+1:])
+				for _, l := range locals {
+					c = append(c, prefix+l)
 				}
 			}
 		}
@@ -230,14 +314,17 @@ func (t *Term) Run() (int, error) {
 	_, _ = t.client.GetState()
 
 	for {
+		locs = nil
+
 		cmdstr, err := t.promptForInput()
 		if err != nil {
 			if err == io.EOF {
-				fmt.Println("exit")
+				fmt.Fprintln(t.stdout, "exit")
 				return t.handleExit()
 			}
 			return 1, fmt.Errorf("Prompt for input failed.\n")
 		}
+		t.stdout.Echo(t.prompt + cmdstr + "\n")
 
 		if strings.TrimSpace(cmdstr) == "" {
 			cmdstr = lastCmd
@@ -264,16 +351,10 @@ func (t *Term) Run() (int, error) {
 				fmt.Fprintf(os.Stderr, "Command failed: %s\n", err)
 			}
 		}
-	}
-}
 
-// Println prints a line to the terminal.
-func (t *Term) Println(prefix, str string) {
-	if !t.dumb {
-		terminalColorEscapeCode := fmt.Sprintf(terminalHighlightEscapeCode, t.conf.SourceListLineColor)
-		prefix = fmt.Sprintf("%s%s%s", terminalColorEscapeCode, prefix, terminalResetEscapeCode)
+		t.stdout.Flush()
+		t.stdout.pw.Reset()
 	}
-	fmt.Fprintf(t.stdout, "%s%s\n", prefix, str)
 }
 
 // Substitutes directory to source file.
@@ -287,40 +368,33 @@ func (t *Term) Println(prefix, str string) {
 // in the order they are defined, first rule that matches is used for
 // substitution.
 func (t *Term) substitutePath(path string) string {
-	path = crossPlatformPath(path)
 	if t.conf == nil {
 		return path
 	}
-
-	// On windows paths returned from headless server are as c:/dir/dir
-	// though os.PathSeparator is '\\'
-
-	separator := "/"                     //make it default
-	if strings.Index(path, "\\") != -1 { //dependent on the path
-		separator = "\\"
-	}
-	for _, r := range t.conf.SubstitutePath {
-		from := crossPlatformPath(r.From)
-		to := r.To
-
-		if !strings.HasSuffix(from, separator) {
-			from = from + separator
-		}
-		if !strings.HasSuffix(to, separator) {
-			to = to + separator
-		}
-		if strings.HasPrefix(path, from) {
-			return strings.Replace(path, from, to, 1)
-		}
-	}
-	return path
+	return locspec.SubstitutePath(path, t.substitutePathRules())
 }
 
-func crossPlatformPath(path string) string {
-	if runtime.GOOS == "windows" {
-		return strings.ToLower(path)
+func (t *Term) substitutePathRules() [][2]string {
+	if t.substitutePathRulesCache != nil {
+		return t.substitutePathRulesCache
 	}
-	return path
+	if t.conf == nil || t.conf.SubstitutePath == nil {
+		return nil
+	}
+	spr := make([][2]string, 0, len(t.conf.SubstitutePath))
+	for _, r := range t.conf.SubstitutePath {
+		spr = append(spr, [2]string{r.From, r.To})
+	}
+	t.substitutePathRulesCache = spr
+	return spr
+}
+
+// formatPath applies path substitution rules and shortens the resulting
+// path by replacing the current directory with './'
+func (t *Term) formatPath(path string) string {
+	path = t.substitutePath(path)
+	workingDir, _ := os.Getwd()
+	return strings.Replace(path, workingDir, ".", 1)
 }
 
 func (t *Term) promptForInput() (string, error) {
@@ -424,7 +498,7 @@ func (t *Term) handleExit() (int, error) {
 	return 0, nil
 }
 
-// loadConfig returns an api.LoadConfig with the parameterss specified in
+// loadConfig returns an api.LoadConfig with the parameters specified in
 // the configuration file.
 func (t *Term) loadConfig() api.LoadConfig {
 	r := api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
@@ -446,9 +520,9 @@ func (t *Term) removeDisplay(n int) error {
 	if n < 0 || n >= len(t.displays) {
 		return fmt.Errorf("%d is out of range", n)
 	}
-	t.displays[n] = ""
+	t.displays[n] = displayEntry{"", ""}
 	for i := len(t.displays) - 1; i >= 0; i-- {
-		if t.displays[i] != "" {
+		if t.displays[i].expr != "" {
 			t.displays = t.displays[:i+1]
 			return nil
 		}
@@ -457,26 +531,26 @@ func (t *Term) removeDisplay(n int) error {
 	return nil
 }
 
-func (t *Term) addDisplay(expr string) {
-	t.displays = append(t.displays, expr)
+func (t *Term) addDisplay(expr, fmtstr string) {
+	t.displays = append(t.displays, displayEntry{expr: expr, fmtstr: fmtstr})
 }
 
 func (t *Term) printDisplay(i int) {
-	expr := t.displays[i]
+	expr, fmtstr := t.displays[i].expr, t.displays[i].fmtstr
 	val, err := t.client.EvalVariable(api.EvalScope{GoroutineID: -1}, expr, ShortLoadConfig)
 	if err != nil {
 		if isErrProcessExited(err) {
 			return
 		}
-		fmt.Printf("%d: %s = error %v\n", i, expr, err)
+		fmt.Fprintf(t.stdout, "%d: %s = error %v\n", i, expr, err)
 		return
 	}
-	fmt.Printf("%d: %s = %s\n", i, val.Name, val.SinglelineString())
+	fmt.Fprintf(t.stdout, "%d: %s = %s\n", i, val.Name, val.SinglelineStringFormatted(fmtstr))
 }
 
 func (t *Term) printDisplays() {
 	for i := range t.displays {
-		if t.displays[i] != "" {
+		if t.displays[i].expr != "" {
 			t.printDisplay(i)
 		}
 	}
@@ -484,6 +558,29 @@ func (t *Term) printDisplays() {
 
 func (t *Term) onStop() {
 	t.printDisplays()
+}
+
+func (t *Term) longCommandCancel() {
+	t.longCommandMu.Lock()
+	defer t.longCommandMu.Unlock()
+	t.longCommandCancelFlag = true
+}
+
+func (t *Term) longCommandStart() {
+	t.longCommandMu.Lock()
+	defer t.longCommandMu.Unlock()
+	t.longCommandCancelFlag = false
+}
+
+func (t *Term) longCommandCanceled() bool {
+	t.longCommandMu.Lock()
+	defer t.longCommandMu.Unlock()
+	return t.longCommandCancelFlag
+}
+
+// RedirectTo redirects the output of this terminal to the specified writer.
+func (t *Term) RedirectTo(w io.Writer) {
+	t.stdout.pw.w = w
 }
 
 // isErrProcessExited returns true if `err` is an RPC error equivalent of proc.ErrProcessExited

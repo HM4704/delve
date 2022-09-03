@@ -1,5 +1,12 @@
 package proc
 
+import (
+	"sync"
+
+	"github.com/go-delve/delve/pkg/elfwriter"
+	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
+)
+
 // Process represents the target of the debugger. This
 // target could be a system process, core file, etc.
 //
@@ -8,30 +15,48 @@ package proc
 // There is one exception to this rule: it is safe to call RequestManualStop
 // concurrently with ContinueOnce.
 type Process interface {
-	Info
-	ProcessManipulation
-	RecordingManipulation
+	BinInfo() *BinaryInfo
+	EntryPoint() (uint64, error)
+
+	FindThread(threadID int) (Thread, bool)
+	ThreadList() []Thread
 
 	Breakpoints() *BreakpointMap
+
+	// Memory returns a memory read/writer for this process's memory.
+	Memory() MemoryReadWriter
 }
 
-// ProcessInternal holds a set of methods that are not meant to be called by
-// anyone except for an instance of `proc.Target`. These methods are not
-// safe to use by themselves and should never be called directly outside of
-// the `proc` package.
-// This is temporary and in support of an ongoing refactor.
+// ProcessInternal holds a set of methods that need to be implemented by a
+// Delve backend. Methods in the Process interface are safe to be called by
+// clients of the 'proc' library, while all other methods are only called
+// directly within 'proc'.
 type ProcessInternal interface {
-	SetCurrentThread(Thread)
-	// Restart restarts the recording from the specified position, or from the
-	// last checkpoint if pos == "".
-	// If pos starts with 'c' it's a checkpoint ID, otherwise it's an event
-	// number.
-	Restart(pos string) error
+	Process
+	// Valid returns true if this Process can be used. When it returns false it
+	// also returns an error describing why the Process is invalid (either
+	// ErrProcessExited or ErrProcessDetached).
+	Valid() (bool, error)
 	Detach(bool) error
-	ContinueOnce() (trapthread Thread, stopReason StopReason, err error)
 
-	WriteBreakpoint(addr uint64) (file string, line int, fn *Function, originalData []byte, err error)
+	// RequestManualStop attempts to stop all the process' threads.
+	RequestManualStop(cctx *ContinueOnceContext) error
+
+	WriteBreakpoint(*Breakpoint) error
 	EraseBreakpoint(*Breakpoint) error
+
+	SupportsBPF() bool
+	SetUProbe(string, int64, []ebpf.UProbeArgMap) error
+	GetBufferedTracepoints() []ebpf.RawUProbeParams
+
+	// DumpProcessNotes returns ELF core notes describing the process and its threads.
+	// Implementing this method is optional.
+	DumpProcessNotes(notes []elfwriter.Note, threadDone func()) (bool, []elfwriter.Note, error)
+	// MemoryMap returns the memory map of the target process. This method must be implemented if CanDump is true.
+	MemoryMap() ([]MemoryMapEntry, error)
+
+	// StartCallInjection notifies the backend that we are about to inject a function call.
+	StartCallInjection() (func(), error)
 }
 
 // RecordingManipulation is an interface for manipulating process recordings.
@@ -53,6 +78,19 @@ type RecordingManipulation interface {
 	ClearCheckpoint(id int) error
 }
 
+// RecordingManipulationInternal is an interface that a Delve backend can
+// implement if it is a recording.
+type RecordingManipulationInternal interface {
+	RecordingManipulation
+
+	// Restart restarts the recording from the specified position, or from the
+	// last checkpoint if pos == "".
+	// If pos starts with 'c' it's a checkpoint ID, otherwise it's an event
+	// number.
+	// Returns the new current thread after the restart has completed.
+	Restart(cctx *ContinueOnceContext, pos string) (Thread, error)
+}
+
 // Direction is the direction of execution for the target process.
 type Direction int8
 
@@ -70,34 +108,29 @@ type Checkpoint struct {
 	Where string
 }
 
-// Info is an interface that provides general information on the target.
-type Info interface {
-	Pid() int
-	// ResumeNotify specifies a channel that will be closed the next time
-	// ContinueOnce finishes resuming the target.
-	ResumeNotify(chan<- struct{})
-	// Valid returns true if this Process can be used. When it returns false it
-	// also returns an error describing why the Process is invalid (either
-	// ErrProcessExited or ErrProcessDetached).
-	Valid() (bool, error)
-	BinInfo() *BinaryInfo
-	EntryPoint() (uint64, error)
-
-	ThreadInfo
+// ContinueOnceContext is an object passed to ContinueOnce that the backend
+// can use to communicate with the target layer.
+type ContinueOnceContext struct {
+	ResumeChan chan<- struct{}
+	StopMu     sync.Mutex
+	// manualStopRequested is set if all the threads in the process were
+	// signalled to stop as a result of a Halt API call. Used to disambiguate
+	// why a thread is found to have stopped.
+	manualStopRequested bool
 }
 
-// ThreadInfo is an interface for getting information on active threads
-// in the process.
-type ThreadInfo interface {
-	FindThread(threadID int) (Thread, bool)
-	ThreadList() []Thread
-	CurrentThread() Thread
+// CheckAndClearManualStopRequest will check for a manual
+// stop and then clear that state.
+func (cctx *ContinueOnceContext) CheckAndClearManualStopRequest() bool {
+	cctx.StopMu.Lock()
+	defer cctx.StopMu.Unlock()
+	msr := cctx.manualStopRequested
+	cctx.manualStopRequested = false
+	return msr
 }
 
-// ProcessManipulation is an interface for changing the execution state of a process.
-type ProcessManipulation interface {
-	RequestManualStop() error
-	// CheckAndClearManualStopRequest returns true the first time it's called
-	// after a call to RequestManualStop.
-	CheckAndClearManualStopRequest() bool
+func (cctx *ContinueOnceContext) GetManualStopRequested() bool {
+	cctx.StopMu.Lock()
+	defer cctx.StopMu.Unlock()
+	return cctx.manualStopRequested
 }

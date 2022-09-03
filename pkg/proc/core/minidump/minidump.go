@@ -7,7 +7,7 @@ package minidump
 // ProcDump utility.
 //
 // The file format is described on MSDN starting at:
-//  https://docs.microsoft.com/en-us/windows/desktop/api/minidumpapiset/ns-minidumpapiset-_minidump_header
+//  https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_header
 // which is the structure found at offset 0 on a minidump file.
 //
 // Further information on the format can be found reading
@@ -120,7 +120,7 @@ type Minidump struct {
 }
 
 // Stream represents one (uninterpreted) stream in a minidump file.
-// See: https://docs.microsoft.com/en-us/windows/desktop/api/minidumpapiset/ns-minidumpapiset-_minidump_directory
+// See: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_directory
 type Stream struct {
 	Type    StreamType
 	Offset  int
@@ -128,18 +128,18 @@ type Stream struct {
 }
 
 // Thread represents an entry in the ThreadList stream.
-// See: https://docs.microsoft.com/en-us/windows/desktop/api/minidumpapiset/ns-minidumpapiset-_minidump_thread
+// See: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_thread
 type Thread struct {
 	ID            uint32
 	SuspendCount  uint32
 	PriorityClass uint32
 	Priority      uint32
 	TEB           uint64
-	Context       winutil.CONTEXT
+	Context       winutil.AMD64CONTEXT
 }
 
 // Module represents an entry in the ModuleList stream.
-// See: https://docs.microsoft.com/en-us/windows/desktop/api/minidumpapiset/ns-minidumpapiset-_minidump_module
+// See: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_module
 type Module struct {
 	BaseOfImage   uint64
 	SizeOfImage   uint32
@@ -155,8 +155,8 @@ type Module struct {
 	MiscRecord []byte
 }
 
-// VSFixedFileInfo: Visual Studio Fixed File Info.
-// See: https://docs.microsoft.com/en-us/windows/desktop/api/verrsrc/ns-verrsrc-tagvs_fixedfileinfo
+// VSFixedFileInfo  Visual Studio Fixed File Info.
+// See: https://docs.microsoft.com/en-us/windows/win32/api/verrsrc/ns-verrsrc-vs_fixedfileinfo
 type VSFixedFileInfo struct {
 	Signature        uint32
 	StructVersion    uint32
@@ -182,7 +182,7 @@ type MemoryRange struct {
 }
 
 // ReadMemory reads len(buf) bytes of memory starting at addr into buf from this memory region.
-func (m *MemoryRange) ReadMemory(buf []byte, addr uintptr) (int, error) {
+func (m *MemoryRange) ReadMemory(buf []byte, addr uint64) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
@@ -194,7 +194,7 @@ func (m *MemoryRange) ReadMemory(buf []byte, addr uintptr) (int, error) {
 }
 
 // MemoryInfo reprents an entry in the MemoryInfoList stream.
-// See: https://docs.microsoft.com/en-us/windows/desktop/api/minidumpapiset/ns-minidumpapiset-_minidump_memory_info
+// See: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_memory_info_list
 type MemoryInfo struct {
 	Addr       uint64
 	Size       uint64
@@ -545,7 +545,7 @@ func readThreadList(mdmp *Minidump, buf *minidumpBuf) {
 
 		readMemoryDescriptor(mdmp, buf)                    // thread stack
 		_, rawThreadContext := readLocationDescriptor(buf) // thread context
-		thread.Context = *((*winutil.CONTEXT)(unsafe.Pointer(&rawThreadContext[0])))
+		thread.Context = *((*winutil.AMD64CONTEXT)(unsafe.Pointer(&rawThreadContext[0])))
 		if buf.err != nil {
 			return
 		}
@@ -596,8 +596,8 @@ func readModuleList(mdmp *Minidump, buf *minidumpBuf) {
 
 // readMemory64List reads a _MINIDUMP_MEMORY64_LIST structure, containing
 // the description of the process memory.
-// See: https://docs.microsoft.com/en-us/windows/desktop/api/minidumpapiset/ns-minidumpapiset-_minidump_memory64_list
-// And: https://docs.microsoft.com/en-us/windows/desktop/api/minidumpapiset/ns-minidumpapiset-_minidump_memory_descriptor
+// See: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_memory64_list
+// And: https://docs.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_memory_descriptor
 func readMemory64List(mdmp *Minidump, buf *minidumpBuf, logfn func(fmt string, args ...interface{})) {
 	rangesNum := buf.u64()
 	baseOff := int(buf.u64())

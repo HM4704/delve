@@ -50,13 +50,13 @@ func TestSplicedReader(t *testing.T) {
 
 	type region struct {
 		data   []byte
-		off    uintptr
-		length uintptr
+		off    uint64
+		length uint64
 	}
 	tests := []struct {
 		name     string
 		regions  []region
-		readAddr uintptr
+		readAddr uint64
 		readLen  int
 		want     []byte
 	}{
@@ -146,6 +146,56 @@ func TestSplicedReader(t *testing.T) {
 			}
 		})
 	}
+
+	// Test some ReadMemory errors
+
+	mem := &splicedMemory{}
+	for _, region := range []region{
+		{[]byte{0xa1, 0xa2, 0xa3, 0xa4}, 0x1000, 4},
+		{[]byte{0xb1, 0xb2, 0xb3, 0xb4}, 0x1004, 4},
+		{[]byte{0xc1, 0xc2, 0xc3, 0xc4}, 0x1010, 4},
+	} {
+		r := bytes.NewReader(region.data)
+		mem.Add(&offsetReaderAt{r, region.off}, region.off, region.length)
+	}
+
+	got := make([]byte, 4)
+
+	// Read before the first mapping
+	_, err := mem.ReadMemory(got, 0x900)
+	if err == nil || !strings.HasPrefix(err.Error(), "error while reading spliced memory at 0x900") {
+		t.Errorf("Read before the start of memory didn't fail (or wrong error): %v", err)
+	}
+
+	// Read after the last mapping
+	_, err = mem.ReadMemory(got, 0x1100)
+	if err == nil || (err.Error() != "offset 4352 did not match any regions") {
+		t.Errorf("Read after the end of memory didn't fail (or wrong error): %v", err)
+	}
+
+	// Read at the start of the first entry
+	_, err = mem.ReadMemory(got, 0x1000)
+	if err != nil || !bytes.Equal(got, []byte{0xa1, 0xa2, 0xa3, 0xa4}) {
+		t.Errorf("Reading at the start of the first entry: %v %#x", err, got)
+	}
+
+	// Read at the start of the second entry
+	_, err = mem.ReadMemory(got, 0x1004)
+	if err != nil || !bytes.Equal(got, []byte{0xb1, 0xb2, 0xb3, 0xb4}) {
+		t.Errorf("Reading at the start of the second entry: %v %#x", err, got)
+	}
+
+	// Read straddling entries 1 and 2
+	_, err = mem.ReadMemory(got, 0x1002)
+	if err != nil || !bytes.Equal(got, []byte{0xa3, 0xa4, 0xb1, 0xb2}) {
+		t.Errorf("Straddled read of the second entry: %v %#x", err, got)
+	}
+
+	// Read past the end of the second entry
+	_, err = mem.ReadMemory(got, 0x1007)
+	if err == nil || !strings.HasPrefix(err.Error(), "error while reading spliced memory at 0x1008") {
+		t.Errorf("Read into gap: %v", err)
+	}
 }
 
 func withCoreFile(t *testing.T, name, args string) *proc.Target {
@@ -202,7 +252,16 @@ func TestCore(t *testing.T) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		return
 	}
+	if runtime.GOOS == "linux" && os.Getenv("CI") == "true" && buildMode == "pie" {
+		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
+	}
 	p := withCoreFile(t, "panic", "")
+	grp := proc.NewGroup(p)
+
+	recorded, _ := grp.Recorded()
+	if !recorded {
+		t.Fatalf("expecting recorded to be true")
+	}
 
 	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
 	if err != nil || len(gs) == 0 {
@@ -244,7 +303,7 @@ func TestCore(t *testing.T) {
 	if mainFrame == nil {
 		t.Fatalf("Couldn't find main in stack %v", panickingStack)
 	}
-	msg, err := proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, *mainFrame).EvalVariable("msg", proc.LoadConfig{MaxStringLen: 64})
+	msg, err := proc.FrameToScope(p, p.Memory(), nil, *mainFrame).EvalExpression("msg", proc.LoadConfig{MaxStringLen: 64})
 	if err != nil {
 		t.Fatalf("Couldn't EvalVariable(msg, ...): %v", err)
 	}
@@ -349,6 +408,9 @@ func TestCoreWithEmptyString(t *testing.T) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		return
 	}
+	if runtime.GOOS == "linux" && os.Getenv("CI") == "true" && buildMode == "pie" {
+		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
+	}
 	p := withCoreFile(t, "coreemptystring", "")
 
 	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
@@ -371,21 +433,21 @@ mainSearch:
 		t.Fatal("could not find main.main frame")
 	}
 
-	scope := proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, *mainFrame)
+	scope := proc.FrameToScope(p, p.Memory(), nil, *mainFrame)
 	loadConfig := proc.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
-	v1, err := scope.EvalVariable("t", loadConfig)
+	v1, err := scope.EvalExpression("t", loadConfig)
 	assertNoError(err, t, "EvalVariable(t)")
 	assertNoError(v1.Unreadable, t, "unreadable variable 't'")
 	t.Logf("t = %#v\n", v1)
-	v2, err := scope.EvalVariable("s", loadConfig)
+	v2, err := scope.EvalExpression("s", loadConfig)
 	assertNoError(err, t, "EvalVariable(s)")
 	assertNoError(v2.Unreadable, t, "unreadable variable 's'")
 	t.Logf("s = %#v\n", v2)
 }
 
 func TestMinidump(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("minidumps can only be produced on windows")
+	if runtime.GOOS != "windows" || runtime.GOARCH != "amd64" {
+		t.Skip("minidumps can only be produced on windows/amd64")
 	}
 	var buildFlags test.BuildFlags
 	if buildMode == "pie" {

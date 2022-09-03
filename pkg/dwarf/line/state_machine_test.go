@@ -30,11 +30,6 @@ func slurpGzip(path string) ([]byte, error) {
 	return ioutil.ReadAll(gzin)
 }
 
-const (
-	newCompileUnit = "NEW COMPILE UNIT"
-	debugLineEnd   = "END"
-)
-
 func TestGrafana(t *testing.T) {
 	// Compares a full execution of our state machine on the debug_line section
 	// of grafana to the output generated using debug/dwarf.LineReader on the
@@ -79,7 +74,8 @@ func TestGrafana(t *testing.T) {
 		}
 		cuname, _ := e.Val(dwarf.AttrName).(string)
 
-		lineInfo := Parse(e.Val(dwarf.AttrCompDir).(string), debugLineBuffer, t.Logf, 0, false, 8)
+		lineInfo := Parse(e.Val(dwarf.AttrCompDir).(string), debugLineBuffer, nil, t.Logf, 0, false, 8)
+		lineInfo.endSeqIsValid = true
 		sm := newStateMachine(lineInfo, lineInfo.Instructions, 8)
 
 		lnrdr, err := data.LineReader(e)

@@ -1,4 +1,5 @@
-//+build darwin,!macnative
+//go:build darwin && !macnative
+// +build darwin,!macnative
 
 package native
 
@@ -6,13 +7,16 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/amd64util"
+	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 )
 
 var ErrNativeBackendDisabled = errors.New("native backend disabled during compilation")
 
 // Launch returns ErrNativeBackendDisabled.
-func Launch(_ []string, _ string, _ bool, _ []string, _ string, _ [3]string) (*proc.Target, error) {
+func Launch(_ []string, _ string, _ proc.LaunchFlags, _ []string, _ string, _ [3]string) (*proc.Target, error) {
 	return nil, ErrNativeBackendDisabled
 }
 
@@ -31,9 +35,7 @@ type osSpecificDetails struct{}
 // osProcessDetails holds Darwin specific information.
 type osProcessDetails struct{}
 
-func findExecutable(path string, pid int) string {
-	panic(ErrNativeBackendDisabled)
-}
+func (os *osProcessDetails) Close() {}
 
 func killProcess(pid int) error {
 	panic(ErrNativeBackendDisabled)
@@ -59,7 +61,7 @@ func (dbp *nativeProcess) trapWait(pid int) (*nativeThread, error) {
 	panic(ErrNativeBackendDisabled)
 }
 
-func (dbp *nativeProcess) stop(trapthread *nativeThread) (err error) {
+func (dbp *nativeProcess) stop(cctx *proc.ContinueOnceContext, trapthread *nativeThread) (*nativeThread, error) {
 	panic(ErrNativeBackendDisabled)
 }
 
@@ -81,33 +83,35 @@ func (dbp *nativeProcess) EntryPoint() (uint64, error) {
 	panic(ErrNativeBackendDisabled)
 }
 
-// Blocked returns true if the thread is blocked
-func (t *nativeThread) Blocked() bool {
+func (dbp *nativeProcess) SupportsBPF() bool {
+	panic(ErrNativeBackendDisabled)
+}
+
+func (dbp *nativeProcess) SetUProbe(fnName string, goidOffset int64, args []ebpf.UProbeArgMap) error {
+	panic(ErrNativeBackendDisabled)
+}
+
+func (dbp *nativeProcess) GetBufferedTracepoints() []ebpf.RawUProbeParams {
 	panic(ErrNativeBackendDisabled)
 }
 
 // SetPC sets the value of the PC register.
-func (t *nativeThread) SetPC(pc uint64) error {
+func (t *nativeThread) setPC(pc uint64) error {
 	panic(ErrNativeBackendDisabled)
 }
 
-// SetSP sets the value of the SP register.
-func (t *nativeThread) SetSP(sp uint64) error {
-	panic(ErrNativeBackendDisabled)
-}
-
-// SetDX sets the value of the DX register.
-func (t *nativeThread) SetDX(dx uint64) error {
+// SetReg changes the value of the specified register.
+func (thread *nativeThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
 	panic(ErrNativeBackendDisabled)
 }
 
 // ReadMemory reads len(buf) bytes at addr into buf.
-func (t *nativeThread) ReadMemory(buf []byte, addr uintptr) (int, error) {
+func (t *nativeThread) ReadMemory(buf []byte, addr uint64) (int, error) {
 	panic(ErrNativeBackendDisabled)
 }
 
 // WriteMemory writes the contents of data at addr.
-func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (int, error) {
+func (t *nativeThread) WriteMemory(addr uint64, data []byte) (int, error) {
 	panic(ErrNativeBackendDisabled)
 }
 
@@ -123,9 +127,18 @@ func (t *nativeThread) restoreRegisters(sr proc.Registers) error {
 	panic(ErrNativeBackendDisabled)
 }
 
+func (t *nativeThread) withDebugRegisters(f func(*amd64util.DebugRegisters) error) error {
+	return proc.ErrHWBreakUnsupported
+}
+
 // Stopped returns whether the thread is stopped at
 // the operating system level.
 func (t *nativeThread) Stopped() bool {
+	panic(ErrNativeBackendDisabled)
+}
+
+// SoftExc returns true if this thread received a software exception during the last resume.
+func (t *nativeThread) SoftExc() bool {
 	panic(ErrNativeBackendDisabled)
 }
 

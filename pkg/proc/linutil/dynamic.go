@@ -44,10 +44,10 @@ func readUintRaw(reader io.Reader, order binary.ByteOrder, ptrSize int) (uint64,
 // dynamicSearchDebug searches for the DT_DEBUG entry in the .dynamic section
 func dynamicSearchDebug(p proc.Process) (uint64, error) {
 	bi := p.BinInfo()
-	mem := p.CurrentThread()
+	mem := p.Memory()
 
 	dynbuf := make([]byte, bi.ElfDynamicSection.Size)
-	_, err := mem.ReadMemory(dynbuf, uintptr(bi.ElfDynamicSection.Addr))
+	_, err := mem.ReadMemory(dynbuf, bi.ElfDynamicSection.Addr)
 	if err != nil {
 		return 0, err
 	}
@@ -73,7 +73,7 @@ func dynamicSearchDebug(p proc.Process) (uint64, error) {
 
 func readPtr(p proc.Process, addr uint64) (uint64, error) {
 	ptrbuf := make([]byte, p.BinInfo().Arch.PtrSize())
-	_, err := p.CurrentThread().ReadMemory(ptrbuf, uintptr(addr))
+	_, err := p.Memory().ReadMemory(ptrbuf, addr)
 	if err != nil {
 		return 0, err
 	}
@@ -115,14 +115,14 @@ func readCString(p proc.Process, addr uint64) (string, error) {
 	if addr == 0 {
 		return "", nil
 	}
-	mem := p.CurrentThread()
+	mem := p.Memory()
 	buf := make([]byte, 1)
 	r := []byte{}
 	for {
 		if len(r) > maxLibraryPathLength {
 			return "", fmt.Errorf("error reading libraries: string too long (%d)", len(r))
 		}
-		_, err := mem.ReadMemory(buf, uintptr(addr))
+		_, err := mem.ReadMemory(buf, addr)
 		if err != nil {
 			return "", err
 		}

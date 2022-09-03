@@ -1,16 +1,18 @@
-//+build darwin,macnative
+//go:build darwin && macnative
+// +build darwin,macnative
 
 package native
 
 // #include "threads_darwin.h"
 import "C"
 import (
-	"errors"
 	"fmt"
 	"unsafe"
 
 	"golang.org/x/arch/x86/x86asm"
 
+	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
 	"github.com/go-delve/delve/pkg/proc"
 )
 
@@ -99,6 +101,10 @@ func (r *Regs) BP() uint64 {
 	return r.rbp
 }
 
+func (r *Regs) LR() uint64 {
+	return 0
+}
+
 // TLS returns the value of the register
 // that contains the location of the thread
 // local storage segment.
@@ -111,7 +117,7 @@ func (r *Regs) GAddr() (uint64, bool) {
 }
 
 // SetPC sets the RIP register to the value specified by `pc`.
-func (thread *nativeThread) SetPC(pc uint64) error {
+func (thread *nativeThread) setPC(pc uint64) error {
 	kret := C.set_pc(thread.os.threadAct, C.uint64_t(pc))
 	if kret != C.KERN_SUCCESS {
 		return fmt.Errorf("could not set pc")
@@ -119,13 +125,12 @@ func (thread *nativeThread) SetPC(pc uint64) error {
 	return nil
 }
 
-// SetSP sets the RSP register to the value specified by `pc`.
-func (thread *nativeThread) SetSP(sp uint64) error {
-	return errors.New("not implemented")
-}
-
-func (thread *nativeThread) SetDX(dx uint64) error {
-	return errors.New("not implemented")
+// SetReg changes the value of the specified register.
+func (thread *nativeThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
+	if regNum != regnum.AMD64_Rip {
+		return fmt.Errorf("changing register %d not implemented", regNum)
+	}
+	return thread.setPC(reg.Uint64Val)
 }
 
 func (r *Regs) Get(n int) (uint64, error) {

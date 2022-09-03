@@ -11,16 +11,17 @@ import (
 
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
+	"github.com/go-delve/delve/pkg/goversion"
 )
 
 // The kind field in runtime._type is a reflect.Kind value plus
 // some extra flags defined here.
 // See equivalent declaration in $GOROOT/src/reflect/type.go
 const (
-	kindDirectIface = 1 << 5
-	kindGCProg      = 1 << 6 // Type.gc points to GC program
+	kindDirectIface = 1 << 5 // +rtype kindDirectIface
+	kindGCProg      = 1 << 6 // +rtype kindGCProg
 	kindNoPointers  = 1 << 7
-	kindMask        = (1 << 5) - 1
+	kindMask        = (1 << 5) - 1 // +rtype kindMask
 )
 
 // Value of tflag field in runtime._type.
@@ -98,16 +99,27 @@ func newLoadDebugInfoMapsContext(bi *BinaryInfo, image *Image, offsetToVersion m
 	return ctxt
 }
 
+func (ctxt *loadDebugInfoMapsContext) lookupAbstractOrigin(bi *BinaryInfo, off dwarf.Offset) int {
+	r, ok := ctxt.abstractOriginTable[off]
+	if !ok {
+		bi.Functions = append(bi.Functions, Function{})
+		r = len(bi.Functions) - 1
+		bi.Functions[r].offset = off
+		ctxt.abstractOriginTable[off] = r
+	}
+	return r
+}
+
 // runtimeTypeToDIE returns the DIE corresponding to the runtime._type.
 // This is done in three different ways depending on the version of go.
-// * Before go1.7 the type name is retrieved directly from the runtime._type
-//   and looked up in debug_info
-// * After go1.7 the runtime._type struct is read recursively to reconstruct
-//   the name of the type, and then the type's name is used to look up
-//   debug_info
-// * After go1.11 the runtimeTypeToDIE map is used to look up the address of
-//   the type and map it drectly to a DIE.
-func runtimeTypeToDIE(_type *Variable, dataAddr uintptr) (typ godwarf.Type, kind int64, err error) {
+//   - Before go1.7 the type name is retrieved directly from the runtime._type
+//     and looked up in debug_info
+//   - After go1.7 the runtime._type struct is read recursively to reconstruct
+//     the name of the type, and then the type's name is used to look up
+//     debug_info
+//   - After go1.11 the runtimeTypeToDIE map is used to look up the address of
+//     the type and map it drectly to a DIE.
+func runtimeTypeToDIE(_type *Variable, dataAddr uint64) (typ godwarf.Type, kind int64, err error) {
 	bi := _type.bi
 
 	_type = _type.maybeDereference()
@@ -122,21 +134,32 @@ func runtimeTypeToDIE(_type *Variable, dataAddr uintptr) (typ godwarf.Type, kind
 	md := findModuleDataForType(bi, mds, _type.Addr, _type.mem)
 	if md != nil {
 		so := bi.moduleDataToImage(md)
-		if rtdie, ok := so.runtimeTypeToDIE[uint64(_type.Addr-md.types)]; ok {
-			typ, err := godwarf.ReadType(so.dwarf, so.index, rtdie.offset, so.typeCache)
-			if err != nil {
-				return nil, 0, fmt.Errorf("invalid interface type: %v", err)
-			}
-			if rtdie.kind == -1 {
-				if kindField := _type.loadFieldNamed("kind"); kindField != nil && kindField.Value != nil {
-					rtdie.kind, _ = constant.Int64Val(kindField.Value)
+		if so != nil {
+			if rtdie, ok := so.runtimeTypeToDIE[uint64(_type.Addr-md.types)]; ok {
+				typ, err := godwarf.ReadType(so.dwarf, so.index, rtdie.offset, so.typeCache)
+				if err != nil {
+					return nil, 0, fmt.Errorf("invalid interface type: %v", err)
 				}
+				if rtdie.kind == -1 {
+					if kindField := _type.loadFieldNamed("kind"); kindField != nil && kindField.Value != nil {
+						rtdie.kind, _ = constant.Int64Val(kindField.Value)
+					}
+				}
+				return typ, rtdie.kind, nil
 			}
-			return typ, rtdie.kind, nil
 		}
 	}
 
 	// go1.7 to go1.10 implementation: convert runtime._type structs to type names
+
+	if goversion.ProducerAfterOrEqual(_type.bi.Producer(), 1, 17) {
+		// Go 1.17 changed the encoding of names in runtime._type breaking the
+		// code below, but the codepath above, using runtimeTypeToDIE should be
+		// enough.
+		// The change happened in commit 287025925f66f90ad9b30aea2e533928026a8376
+		// reviewed in https://go-review.googlesource.com/c/go/+/318249
+		return nil, 0, fmt.Errorf("could not resolve interface type")
+	}
 
 	typename, kind, err := nameOfRuntimeType(mds, _type)
 	if err != nil {
@@ -149,6 +172,34 @@ func runtimeTypeToDIE(_type *Variable, dataAddr uintptr) (typ godwarf.Type, kind
 	}
 
 	return typ, kind, nil
+}
+
+// resolveParametricType returns the real type of t if t is a parametric
+// type, by reading the correct dictionary entry.
+func resolveParametricType(tgt *Target, bi *BinaryInfo, mem MemoryReadWriter, t godwarf.Type, dictAddr uint64) (godwarf.Type, error) {
+	ptyp, _ := t.(*godwarf.ParametricType)
+	if ptyp == nil {
+		return t, nil
+	}
+	if dictAddr == 0 {
+		return ptyp.TypedefType.Type, errors.New("parametric type without a dictionary")
+	}
+	rtypeAddr, err := readUintRaw(mem, dictAddr+uint64(ptyp.DictIndex*int64(bi.Arch.PtrSize())), int64(bi.Arch.PtrSize()))
+	if err != nil {
+		return ptyp.TypedefType.Type, err
+	}
+	runtimeType, err := bi.findType("runtime._type")
+	if err != nil {
+		return ptyp.TypedefType.Type, err
+	}
+	_type := newVariable("", rtypeAddr, runtimeType, bi, mem)
+
+	typ, _, err := runtimeTypeToDIE(_type, 0)
+	if err != nil {
+		return ptyp.TypedefType.Type, err
+	}
+
+	return typ, nil
 }
 
 type nameOfRuntimeTypeEntry struct {
@@ -218,7 +269,7 @@ func nameOfNamedRuntimeType(mds []moduleData, _type *Variable, kind, tflag int64
 	// For a description of how memory is organized for type names read
 	// the comment to 'type name struct' in $GOROOT/src/reflect/type.go
 
-	typename, _, _, err = resolveNameOff(_type.bi, mds, _type.Addr, uintptr(strOff), _type.mem)
+	typename, _, _, err = resolveNameOff(_type.bi, mds, _type.Addr, uint64(strOff), _type.mem)
 	if err != nil {
 		return "", err
 	}
@@ -244,7 +295,7 @@ func nameOfNamedRuntimeType(mds []moduleData, _type *Variable, kind, tflag int64
 	if ut := uncommon(_type, tflag); ut != nil {
 		if pkgPathField := ut.loadFieldNamed("pkgpath"); pkgPathField != nil && pkgPathField.Value != nil {
 			pkgPathOff, _ := constant.Int64Val(pkgPathField.Value)
-			pkgPath, _, _, err := resolveNameOff(_type.bi, mds, _type.Addr, uintptr(pkgPathOff), _type.mem)
+			pkgPath, _, _, err := resolveNameOff(_type.bi, mds, _type.Addr, uint64(pkgPathOff), _type.mem)
 			if err != nil {
 				return "", err
 			}
@@ -344,7 +395,7 @@ func nameOfFuncRuntimeType(mds []moduleData, _type *Variable, tflag int64, anony
 		outCount = outCount & (1<<15 - 1)
 	}
 
-	cursortyp := _type.newVariable("", _type.Addr+uintptr(uadd), prtyp, _type.mem)
+	cursortyp := _type.newVariable("", _type.Addr+uint64(uadd), prtyp, _type.mem)
 	var buf bytes.Buffer
 	if anonymous {
 		buf.WriteString("func(")
@@ -354,7 +405,7 @@ func nameOfFuncRuntimeType(mds []moduleData, _type *Variable, tflag int64, anony
 
 	for i := int64(0); i < inCount; i++ {
 		argtype := cursortyp.maybeDereference()
-		cursortyp.Addr += uintptr(_type.bi.Arch.PtrSize())
+		cursortyp.Addr += uint64(_type.bi.Arch.PtrSize())
 		argtypename, _, err := nameOfRuntimeType(mds, argtype)
 		if err != nil {
 			return "", err
@@ -381,7 +432,7 @@ func nameOfFuncRuntimeType(mds []moduleData, _type *Variable, tflag int64, anony
 		buf.WriteString(" (")
 		for i := int64(0); i < outCount; i++ {
 			argtype := cursortyp.maybeDereference()
-			cursortyp.Addr += uintptr(_type.bi.Arch.PtrSize())
+			cursortyp.Addr += uint64(_type.bi.Arch.PtrSize())
 			argtypename, _, err := nameOfRuntimeType(mds, argtype)
 			if err != nil {
 				return "", err
@@ -419,14 +470,14 @@ func nameOfInterfaceRuntimeType(mds []moduleData, _type *Variable, kind, tflag i
 			case imethodFieldName:
 				nameoff, _ := constant.Int64Val(im.Children[i].Value)
 				var err error
-				methodname, _, _, err = resolveNameOff(_type.bi, mds, _type.Addr, uintptr(nameoff), _type.mem)
+				methodname, _, _, err = resolveNameOff(_type.bi, mds, _type.Addr, uint64(nameoff), _type.mem)
 				if err != nil {
 					return "", err
 				}
 
 			case imethodFieldItyp:
 				typeoff, _ := constant.Int64Val(im.Children[i].Value)
-				typ, err := resolveTypeOff(_type.bi, mds, _type.Addr, uintptr(typeoff), _type.mem)
+				typ, err := resolveTypeOff(_type.bi, mds, _type.Addr, uint64(typeoff), _type.mem)
 				if err != nil {
 					return "", err
 				}
@@ -489,7 +540,7 @@ func nameOfStructRuntimeType(mds []moduleData, _type *Variable, kind, tflag int6
 				}
 
 				var err error
-				fieldname, _, _, err = loadName(_type.bi, uintptr(nameoff), _type.mem)
+				fieldname, _, _, err = loadName(_type.bi, uint64(nameoff), _type.mem)
 				if err != nil {
 					return "", err
 				}
@@ -564,7 +615,7 @@ func uncommon(_type *Variable, tflag int64) *Variable {
 		return nil
 	}
 
-	return _type.newVariable(_type.Name, _type.Addr+uintptr(_type.RealType.Size()), typ, _type.mem)
+	return _type.newVariable(_type.Name, _type.Addr+uint64(_type.RealType.Size()), typ, _type.mem)
 }
 
 var kindToRuntimeTypeName = map[reflect.Kind]string{
@@ -627,7 +678,7 @@ func dwarfToRuntimeType(bi *BinaryInfo, mem MemoryReadWriter, typ godwarf.Type) 
 	if err != nil {
 		return 0, 0, false, err
 	}
-	_type := newVariable("", uintptr(typeAddr), rtyp, bi, mem)
+	_type := newVariable("", typeAddr, rtyp, bi, mem)
 	kindv := _type.loadFieldNamed("kind")
 	if kindv.Unreadable != nil || kindv.Kind != reflect.Uint {
 		return 0, 0, false, fmt.Errorf("unreadable interface type: %v", kindv.Unreadable)

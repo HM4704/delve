@@ -55,95 +55,41 @@ func main() {
 		}
 	}
 
-	out := bufio.NewWriter(os.Stdout)
-	err := template.Must(template.New("travis.yml").Parse(`language: go
-sudo: required
-go_import_path: github.com/go-delve/delve
+	githubfh, err := os.Create(".github/workflows/test.yml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not create .github/test.yml: %v", err)
+		os.Exit(1)
+	}
+	out := bufio.NewWriter(githubfh)
+	err = template.Must(template.New(".github/workflows/test.yml").Parse(`name: Delve CI
 
-os:
-  - linux
-  - osx
-  - windows
+on: [push, pull_request]
 
-arch:
-  - amd64
-  - arm64
-
-go:
-{{- range .GoVersions}}
-  - {{.DotX}}
-{{- end}}
-  - tip
-
-matrix:
-  allow_failures:
-    - go: tip
-  exclude:
-    - os: osx
-      arch: arm64
-    - os: windows
-      arch: arm64
-{{- /* Exclude all testing on anything except the most recent version of Go for anything that isn't (GOOS=linux, GOARCH=amd64)*/ -}}
-{{- range .GoVersions}}{{if not .MaxVersion}}
-    - os: windows
-      go: {{.DotX}}
-{{- end}}{{end -}}
-{{- range .GoVersions}}{{if not .MaxVersion}}
-    - os: osx
-      go: {{.DotX}}
-{{- end}}{{end -}}
-{{- range .GoVersions}}{{if not .MaxVersion}}
-    - arch: arm64
-      go: {{.DotX}}
-{{- end}}{{end}}
-    - os: windows
-      go: tip
-    - arch: arm64
-      go: tip
-
-before_install:
-  - export GOFLAGS=-mod=vendor
-  - if [ $TRAVIS_OS_NAME = "linux" ]; then sudo apt-get -qq update; sudo apt-get install -y dwz; echo "dwz version $(dwz --version)"; fi
-  - if [ $TRAVIS_OS_NAME = "windows" ]; then choco install procdump make; fi
-
-
-# 386 linux
 jobs:
-  include:
-    -  os: linux
-       services: docker
-       env: go_32_version={{index .GoVersions 1}} # Linux/i386 tests held back to Go1.14 until issue #2134 is fixed
-
-script: >-
-    if [ $TRAVIS_OS_NAME = "linux" ] && [ $go_32_version ]; then
-      docker pull i386/centos:7;
-      docker run \
-      -v $(pwd):/delve \
-      --env TRAVIS=true \
-      --env CI=true \
-      --privileged i386/centos:7 \
-      /bin/bash -c "set -x && \
-           cd delve && \
-           yum -y update && yum -y upgrade && \
-           yum -y install wget make git gcc && \
-           wget -q https://dl.google.com/go/go${go_32_version}.linux-386.tar.gz && \
-           tar -C /usr/local -xzf go${go_32_version}.linux-386.tar.gz && \
-           export PATH=$PATH:/usr/local/go/bin && \
-           go version && \
-           uname -a && \
-           make test";
-    else
-      make test;
-    fi
-  
-cache:
-  directories:
-    - $HOME/AppData/Local/Temp/chocolatey
+  build:
+    runs-on: ${{"{{"}}matrix.os{{"}}"}}
+    strategy:
+      matrix:
+        include:
+          - go: {{index .GoVersions 0}}
+            os: macos-latest
+          - go: {{index .GoVersions 1}}
+            os: ubuntu-latest
+          - go: {{index .GoVersions 2}}
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v1
+        with:
+          go-version: ${{"{{"}}matrix.go{{"}}"}}
+      - run: go run _scripts/make.go test
 `)).Execute(out, args)
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error executing template: %v", err)
 		os.Exit(1)
 	}
+
 	_ = out.Flush()
+	_ = githubfh.Close()
 }

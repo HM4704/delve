@@ -1,33 +1,53 @@
 ## dlv dap
 
-[EXPERIMENTAL] Starts a TCP server communicating via Debug Adaptor Protocol (DAP).
+Starts a headless TCP server communicating via Debug Adaptor Protocol (DAP).
 
 ### Synopsis
 
+Starts a headless TCP server communicating via Debug Adaptor Protocol (DAP).
 
-[EXPERIMENTAL] Starts a TCP server communicating via Debug Adaptor Protocol (DAP).
+The server is always headless and requires a DAP client like VS Code to connect and request a binary
+to be launched or a process to be attached to. The following modes can be specified via the client's launch config:
+- launch + exec   (executes precompiled binary, like 'dlv exec')
+- launch + debug  (builds and launches, like 'dlv debug')
+- launch + test   (builds and tests, like 'dlv test')
+- launch + replay (replays an rr trace, like 'dlv replay')
+- launch + core   (replays a core dump file, like 'dlv core')
+- attach + local  (attaches to a running process, like 'dlv attach')
 
-The server supports debugging of a precompiled binary akin to 'dlv exec' via a launch request.
-It does not yet support support specification of program arguments.
-It does not yet support launch requests with 'debug' and 'test' modes that require compilation.
-It does not yet support attach requests to debug a running process like with 'dlv attach'.
-It does not yet support asynchronous request-response communication.
-The server does not accept multiple client connections.
+Program and output binary paths will be interpreted relative to dlv's working directory.
+
+This server does not accept multiple client connections (--accept-multiclient).
+Use 'dlv [command] --headless' instead and a DAP client with attach + remote config.
+While --continue is not supported, stopOnEntry launch/attach attribute can be used to control if
+execution is resumed at the start of the debug session.
+
+The --client-addr flag is a special flag that makes the server initiate a debug session
+by dialing in to the host:port where a DAP client is waiting. This server process
+will exit when the debug session ends.
 
 ```
-dlv dap
+dlv dap [flags]
+```
+
+### Options
+
+```
+      --client-addr string   host:port where the DAP client is waiting for the DAP server to dial in
+  -h, --help                 help for dap
 ```
 
 ### Options inherited from parent commands
 
 ```
-      --accept-multiclient               Allows a headless server to accept multiple client connections.
+      --accept-multiclient               Allows a headless server to accept multiple client connections via JSON-RPC or DAP.
       --allow-non-terminal-interactive   Allows interactive sessions of Delve that don't have a terminal as stdin, stdout and stderr
-      --api-version int                  Selects API version when headless. New clients should use v2. Can be reset via RPCServer.SetApiVersion. See Documentation/api/json-rpc/README.md. (default 1)
+      --api-version int                  Selects JSON-RPC API version when headless. New clients should use v2. Can be reset via RPCServer.SetApiVersion. See Documentation/api/json-rpc/README.md. (default 1)
       --backend string                   Backend selection (see 'dlv help backend'). (default "default")
-      --build-flags string               Build flags, to be passed to the compiler.
-      --check-go-version                 Checks that the version of Go in use is compatible with Delve. (default true)
-      --headless                         Run debug server only, in headless mode.
+      --build-flags string               Build flags, to be passed to the compiler. For example: --build-flags="-tags=integration -mod=vendor -cover -v"
+      --check-go-version                 Exits if the version of Go in use is not compatible (too old or too new) with the version of Delve. (default true)
+      --disable-aslr                     Disables address space randomization
+      --headless                         Run debug server only, in headless mode. Server will accept both JSON-RPC or DAP client connections.
       --init string                      Init file, executed by the terminal client.
   -l, --listen string                    Debugging server listen address. (default "127.0.0.1:0")
       --log                              Enable debugging server logging.
@@ -39,5 +59,6 @@ dlv dap
 ```
 
 ### SEE ALSO
+
 * [dlv](dlv.md)	 - Delve is a debugger for the Go programming language.
 

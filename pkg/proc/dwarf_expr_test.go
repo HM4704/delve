@@ -64,7 +64,7 @@ func newFakeMemory(base uint64, contents ...interface{}) *fakeMemory {
 	return mem
 }
 
-func (mem *fakeMemory) ReadMemory(data []byte, addr uintptr) (int, error) {
+func (mem *fakeMemory) ReadMemory(data []byte, addr uint64) (int, error) {
 	if uint64(addr) < mem.base {
 		return 0, fmt.Errorf("read out of bounds %d %#x", len(data), addr)
 	}
@@ -77,8 +77,17 @@ func (mem *fakeMemory) ReadMemory(data []byte, addr uintptr) (int, error) {
 	return len(data), nil
 }
 
-func (mem *fakeMemory) WriteMemory(uintptr, []byte) (int, error) {
-	return 0, fmt.Errorf("not implemented")
+func (mem *fakeMemory) WriteMemory(addr uint64, data []byte) (int, error) {
+	if uint64(addr) < mem.base {
+		return 0, fmt.Errorf("write out of bounds %d %#x", len(data), addr)
+	}
+	start := uint64(addr) - mem.base
+	end := uint64(len(data)) + start
+	if end > uint64(len(mem.data)) {
+		panic(fmt.Errorf("write out of bounds %d %#x", len(data), addr))
+	}
+	copy(mem.data[start:end], data)
+	return len(data), nil
 }
 
 func uintExprCheck(t *testing.T, scope *proc.EvalScope, expr string, tgt uint64) {
@@ -93,16 +102,29 @@ func uintExprCheck(t *testing.T, scope *proc.EvalScope, expr string, tgt uint64)
 	}
 }
 
-func dwarfExprCheck(t *testing.T, mem proc.MemoryReadWriter, regs op.DwarfRegisters, bi *proc.BinaryInfo, testCases map[string]uint16, fn *proc.Function) *proc.EvalScope {
-	scope := &proc.EvalScope{Location: proc.Location{PC: 0x40100, Fn: fn}, Regs: regs, Mem: mem, BinInfo: bi}
+func fakeScope(mem proc.MemoryReadWriter, regs *op.DwarfRegisters, bi *proc.BinaryInfo, fn *proc.Function) *proc.EvalScope {
+	return &proc.EvalScope{Location: proc.Location{PC: 0x40100, Fn: fn}, Regs: *regs, Mem: mem, BinInfo: bi}
+}
+
+func dwarfExprCheck(t *testing.T, scope *proc.EvalScope, testCases map[string]uint16) {
 	for name, value := range testCases {
 		uintExprCheck(t, scope, name, uint64(value))
 	}
-
-	return scope
 }
 
-func dwarfRegisters(bi *proc.BinaryInfo, regs *linutil.AMD64Registers) op.DwarfRegisters {
+func exprToStringCheck(t *testing.T, scope *proc.EvalScope, exprToStringCheck map[string]string) {
+	for name, expr := range exprToStringCheck {
+		thevar, err := scope.EvalExpression(name, normalLoadConfig)
+		assertNoError(err, t, fmt.Sprintf("EvalExpression(%s)", name))
+		out := thevar.LocationExpr.String()
+		t.Logf("%q -> %q\n", name, out)
+		if out != expr {
+			t.Errorf("%q expected expression: %q got %q", name, expr, out)
+		}
+	}
+}
+
+func dwarfRegisters(bi *proc.BinaryInfo, regs *linutil.AMD64Registers) *op.DwarfRegisters {
 	a := proc.AMD64Arch("linux")
 	so := bi.PCToImage(regs.PC())
 	dwarfRegs := a.RegistersToDwarfRegisters(so.StaticBase, regs)
@@ -137,14 +159,22 @@ func TestDwarfExprRegisters(t *testing.T) {
 	regs.Regs.Rax = uint64(testCases["a"])
 	regs.Regs.Rdx = uint64(testCases["c"])
 
-	dwarfExprCheck(t, mem, dwarfRegisters(bi, &regs), bi, testCases, mainfn)
+	dwarfExprCheck(t, fakeScope(mem, dwarfRegisters(bi, &regs), bi, mainfn), testCases)
 }
 
 func TestDwarfExprComposite(t *testing.T) {
 	testCases := map[string]uint16{
-		"pair.k": 0x8765,
-		"pair.v": 0x5678,
-		"n":      42,
+		"pair.k":  0x8765,
+		"pair.v":  0x5678,
+		"n":       42,
+		"pair2.k": 0x8765,
+		"pair2.v": 0,
+	}
+
+	testCasesExprToString := map[string]string{
+		"pair":  "[block] DW_OP_reg2(Rcx) DW_OP_piece 0x2 DW_OP_call_frame_cfa DW_OP_consts 0x10 DW_OP_plus DW_OP_piece 0x2 ",
+		"n":     "[block] DW_OP_reg3(Rbx) ",
+		"pair2": "[block] DW_OP_reg2(Rcx) DW_OP_piece 0x2 DW_OP_piece 0x2 ",
 	}
 
 	const stringVal = "this is a string"
@@ -178,6 +208,9 @@ func TestDwarfExprComposite(t *testing.T) {
 		op.DW_OP_reg1, op.DW_OP_piece, uint(8),
 		op.DW_OP_reg0, op.DW_OP_piece, uint(8)))
 	dwb.AddVariable("n", intoff, dwarfbuilder.LocationBlock(op.DW_OP_reg3))
+	dwb.AddVariable("pair2", pairoff, dwarfbuilder.LocationBlock(
+		op.DW_OP_reg2, op.DW_OP_piece, uint(2),
+		op.DW_OP_piece, uint(2)))
 	dwb.TagClose()
 
 	bi, _ := fakeBinaryInfo(t, dwb)
@@ -192,7 +225,18 @@ func TestDwarfExprComposite(t *testing.T) {
 	regs.Regs.Rcx = uint64(testCases["pair.k"])
 	regs.Regs.Rbx = uint64(testCases["n"])
 
-	scope := dwarfExprCheck(t, mem, dwarfRegisters(bi, &regs), bi, testCases, mainfn)
+	dwarfRegs := dwarfRegisters(bi, &regs)
+	var changeCalls []string
+	dwarfRegs.ChangeFunc = func(regNum uint64, reg *op.DwarfRegister) error {
+		t.Logf("SetReg(%d, %x)", regNum, reg.Bytes)
+		changeCalls = append(changeCalls, fmt.Sprintf("%d - %x", regNum, reg.Bytes))
+		return nil
+	}
+
+	scope := fakeScope(mem, dwarfRegs, bi, mainfn)
+
+	dwarfExprCheck(t, scope, testCases)
+	exprToStringCheck(t, scope, testCasesExprToString)
 
 	thevar, err := scope.EvalExpression("s", normalLoadConfig)
 	assertNoError(err, t, fmt.Sprintf("EvalExpression(%s)", "s"))
@@ -202,6 +246,29 @@ func TestDwarfExprComposite(t *testing.T) {
 		if v := constant.StringVal(thevar.Value); v != stringVal {
 			t.Errorf("expected value %q got %q", stringVal, v)
 		}
+	}
+
+	// Test writes to composite memory
+
+	assertNoError(scope.SetVariable("n", "47"), t, "SetVariable(n, 47)")
+	assertNoError(scope.SetVariable("pair.k", "12"), t, "SetVariable(pair.k, 12)")
+	assertNoError(scope.SetVariable("pair.v", "13"), t, "SetVariable(pair.v, 13)")
+
+	for i := range changeCalls {
+		t.Logf("%q\n", changeCalls[i])
+	}
+
+	if len(changeCalls) != 2 {
+		t.Errorf("wrong number of calls to SetReg")
+	}
+	if changeCalls[0] != "3 - 2f00000000000000" {
+		t.Errorf("wrong call to SetReg (Rbx)")
+	}
+	if changeCalls[1] != "2 - 0c00000000000000" {
+		t.Errorf("wrong call to SetReg (Rcx)")
+	}
+	if mem.data[0x10] != 13 || mem.data[0x11] != 0x00 {
+		t.Errorf("memory was not written %v", mem.data[:2])
 	}
 }
 
@@ -228,7 +295,7 @@ func TestDwarfExprLoclist(t *testing.T) {
 	const PC = 0x40100
 	regs := linutil.AMD64Registers{Regs: &linutil.AMD64PtraceRegs{Rip: PC}}
 
-	scope := &proc.EvalScope{Location: proc.Location{PC: PC, Fn: mainfn}, Regs: dwarfRegisters(bi, &regs), Mem: mem, BinInfo: bi}
+	scope := &proc.EvalScope{Location: proc.Location{PC: PC, Fn: mainfn}, Regs: *dwarfRegisters(bi, &regs), Mem: mem, BinInfo: bi}
 
 	uintExprCheck(t, scope, "a", before)
 	scope.PC = 0x40800
@@ -278,9 +345,6 @@ func TestIssue1419(t *testing.T) {
 }
 
 func TestLocationCovers(t *testing.T) {
-	const before = 0x1234
-	const after = 0x4321
-
 	dwb := dwarfbuilder.New()
 
 	uint16off := dwb.AddBaseType("uint16", dwarfbuilder.DW_ATE_unsigned, 2)
@@ -351,5 +415,45 @@ func TestNestedCompileUnts(t *testing.T) {
 	bi, _ := fakeBinaryInfo(t, dwb)
 	if n := len(bi.PackageVars()); n != 2 {
 		t.Errorf("expected 2 variables, got %d", n)
+	}
+}
+
+func TestAbstractOriginDefinedAfterUse(t *testing.T) {
+	// Tests that an abstract origin entry can appear after its uses.
+	dwb := dwarfbuilder.New()
+	dwb.AddCompileUnit("main", 0x0)
+
+	// Concrete implementation
+	dwb.TagOpen(dwarf.TagSubprogram, "")
+	originRef1 := dwb.Attr(dwarf.AttrAbstractOrigin, dwarf.Offset(0))
+	dwb.Attr(dwarf.AttrLowpc, dwarfbuilder.Address(0x40100))
+	dwb.Attr(dwarf.AttrHighpc, dwarfbuilder.Address(0x41000))
+	dwb.TagClose()
+
+	// Inlined call
+	dwb.AddSubprogram("callingFn", 0x41100, 0x42000)
+	dwb.TagOpen(dwarf.TagInlinedSubroutine, "")
+	originRef2 := dwb.Attr(dwarf.AttrAbstractOrigin, dwarf.Offset(0))
+	dwb.Attr(dwarf.AttrLowpc, dwarfbuilder.Address(0x41150))
+	dwb.Attr(dwarf.AttrHighpc, dwarfbuilder.Address(0x41155))
+	dwb.Attr(dwarf.AttrCallFile, uint8(1))
+	dwb.Attr(dwarf.AttrCallLine, uint8(1))
+	dwb.TagClose()
+	dwb.TagClose()
+
+	// Abstract origin
+	abstractOriginOff := dwb.TagOpen(dwarf.TagSubprogram, "inlinedFn")
+	dwb.Attr(dwarf.AttrInline, uint8(1))
+	dwb.TagClose()
+
+	dwb.TagClose()
+
+	dwb.PatchOffset(originRef1, abstractOriginOff)
+	dwb.PatchOffset(originRef2, abstractOriginOff)
+
+	bi, _ := fakeBinaryInfo(t, dwb)
+	fn := bi.PCToFunc(0x40100)
+	if fn == nil {
+		t.Fatalf("could not find concrete instance of inlined function")
 	}
 }

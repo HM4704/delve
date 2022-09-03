@@ -1,6 +1,7 @@
 package rpccommon
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -19,7 +20,9 @@ import (
 	"github.com/go-delve/delve/pkg/version"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
+	"github.com/go-delve/delve/service/dap"
 	"github.com/go-delve/delve/service/debugger"
+	"github.com/go-delve/delve/service/internal/sameuser"
 	"github.com/go-delve/delve/service/rpc1"
 	"github.com/go-delve/delve/service/rpc2"
 	"github.com/sirupsen/logrus"
@@ -46,11 +49,14 @@ type ServerImpl struct {
 }
 
 type RPCCallback struct {
-	s       *ServerImpl
-	sending *sync.Mutex
-	codec   rpc.ServerCodec
-	req     rpc.Request
+	s         *ServerImpl
+	sending   *sync.Mutex
+	codec     rpc.ServerCodec
+	req       rpc.Request
+	setupDone chan struct{}
 }
+
+var _ service.RPCCallback = &RPCCallback{}
 
 // RPCServer implements the RPC method calls common to all versions of the API.
 type RPCServer struct {
@@ -73,7 +79,7 @@ func NewServer(config *service.Config) *ServerImpl {
 	}
 	if config.Debugger.Foreground {
 		// Print listener address
-		logflags.WriteAPIListeningMessage(config.Listener.Addr().String())
+		logflags.WriteAPIListeningMessage(config.Listener.Addr())
 		logger.Debug("API server pid = ", os.Getpid())
 	}
 	return &ServerImpl{
@@ -86,9 +92,13 @@ func NewServer(config *service.Config) *ServerImpl {
 
 // Stop stops the JSON-RPC server.
 func (s *ServerImpl) Stop() error {
+	s.log.Debug("stopping")
+	close(s.stopChan)
 	if s.config.AcceptMulti {
-		close(s.stopChan)
 		s.listener.Close()
+	}
+	if s.debugger.IsRunning() {
+		s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
 	}
 	kill := s.config.Debugger.AttachPid == 0
 	return s.debugger.Detach(kill)
@@ -142,13 +152,13 @@ func (s *ServerImpl) Run() error {
 			}
 
 			if s.config.CheckLocalConnUser {
-				if !canAccept(s.listener.Addr(), c.RemoteAddr()) {
+				if !sameuser.CanAccept(s.listener.Addr(), c.LocalAddr(), c.RemoteAddr()) {
 					c.Close()
 					continue
 				}
 			}
 
-			go s.serveJSONCodec(c)
+			go s.serveConnectionDemux(c)
 			if !s.config.AcceptMulti {
 				break
 			}
@@ -157,14 +167,36 @@ func (s *ServerImpl) Run() error {
 	return nil
 }
 
+type bufReadWriteCloser struct {
+	*bufio.Reader
+	io.WriteCloser
+}
+
+func (s *ServerImpl) serveConnectionDemux(c io.ReadWriteCloser) {
+	conn := &bufReadWriteCloser{bufio.NewReader(c), c}
+	b, err := conn.Peek(1)
+	if err != nil {
+		s.log.Warnf("error determining new connection protocol: %v", err)
+		return
+	}
+	if b[0] == 'C' { // C is for DAP's Content-Length
+		s.log.Debugf("serving DAP on new connection")
+		ds := dap.NewSession(conn, &dap.Config{Config: s.config, StopTriggered: s.stopChan}, s.debugger)
+		go ds.ServeDAPCodec()
+	} else {
+		s.log.Debugf("serving JSON-RPC on new connection")
+		go s.serveJSONCodec(conn)
+	}
+}
+
 // Precompute the reflect type for error.  Can't use error directly
 // because Typeof takes an empty interface value.  This is annoying.
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 
 // Is this an exported - upper case - name?
 func isExported(name string) bool {
-	rune, _ := utf8.DecodeRuneInString(name)
-	return unicode.IsUpper(rune)
+	ch, _ := utf8.DecodeRuneInString(name)
+	return unicode.IsUpper(ch)
 }
 
 // Is this type exported or a builtin?
@@ -181,8 +213,9 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 // available through the RPC interface.
 // These are all the public methods of rcvr that have one of those
 // two signatures:
-//  func (rcvr ReceiverType) Method(in InputType, out *ReplyType) error
-//  func (rcvr ReceiverType) Method(in InputType, cb service.RPCCallback)
+//
+//	func (rcvr ReceiverType) Method(in InputType, out *ReplyType) error
+//	func (rcvr ReceiverType) Method(in InputType, cb service.RPCCallback)
 func suitableMethods(rcvr interface{}, methods map[string]*methodType, log *logrus.Entry) {
 	typ := reflect.TypeOf(rcvr)
 	rcvrv := reflect.ValueOf(rcvr)
@@ -236,12 +269,10 @@ func suitableMethods(rcvr interface{}, methods map[string]*methodType, log *logr
 				log.Warn("method", mname, "returns", returnType.String(), "not error")
 				continue
 			}
-		} else {
+		} else if mtype.NumOut() != 0 {
 			// Method needs zero outs.
-			if mtype.NumOut() != 0 {
-				log.Warn("method", mname, "has wrong number of outs:", mtype.NumOut())
-				continue
-			}
+			log.Warn("method", mname, "has wrong number of outs:", mtype.NumOut())
+			continue
 		}
 		methods[sname+"."+mname] = &methodType{method: method, ArgType: argType, ReplyType: replyType, Synchronous: synchronous, Rcvr: rcvrv}
 	}
@@ -322,13 +353,17 @@ func (s *ServerImpl) serveJSONCodec(conn io.ReadWriteCloser) {
 				s.log.Debugf("-> %T%s error: %q", replyv.Interface(), replyvbytes, errmsg)
 			}
 			s.sendResponse(sending, &req, &resp, replyv.Interface(), codec, errmsg)
+			if req.ServiceMethod == "RPCServer.Detach" && s.config.DisconnectChan != nil {
+				close(s.config.DisconnectChan)
+				s.config.DisconnectChan = nil
+			}
 		} else {
 			if logflags.RPC() {
 				argvbytes, _ := json.Marshal(argv.Interface())
 				s.log.Debugf("(async %d) <- %s(%T%s)", req.Seq, req.ServiceMethod, argv.Interface(), argvbytes)
 			}
 			function := mtype.method.Func
-			ctl := &RPCCallback{s, sending, codec, req}
+			ctl := &RPCCallback{s, sending, codec, req, make(chan struct{})}
 			go func() {
 				defer func() {
 					if ierr := recover(); ierr != nil {
@@ -337,6 +372,7 @@ func (s *ServerImpl) serveJSONCodec(conn io.ReadWriteCloser) {
 				}()
 				function.Call([]reflect.Value{mtype.Rcvr, argv, reflect.ValueOf(ctl)})
 			}()
+			<-ctl.setupDone
 		}
 	}
 	codec.Close()
@@ -363,6 +399,12 @@ func (s *ServerImpl) sendResponse(sending *sync.Mutex, req *rpc.Request, resp *r
 }
 
 func (cb *RPCCallback) Return(out interface{}, err error) {
+	select {
+	case <-cb.setupDone:
+		// already closed
+	default:
+		close(cb.setupDone)
+	}
 	errmsg := ""
 	if err != nil {
 		errmsg = err.Error()
@@ -375,6 +417,10 @@ func (cb *RPCCallback) Return(out interface{}, err error) {
 	cb.s.sendResponse(cb.sending, &cb.req, &resp, out, cb.codec, errmsg)
 }
 
+func (cb *RPCCallback) SetupDoneChan() chan struct{} {
+	return cb.setupDone
+}
+
 // GetVersion returns the version of delve as well as the API version
 // currently served.
 func (s *RPCServer) GetVersion(args api.GetVersionIn, out *api.GetVersionOut) error {
@@ -383,7 +429,7 @@ func (s *RPCServer) GetVersion(args api.GetVersionIn, out *api.GetVersionOut) er
 	return s.s.debugger.GetVersion(out)
 }
 
-// Changes version of the API being served.
+// SetApiVersion changes version of the API being served.
 func (s *RPCServer) SetApiVersion(args api.SetAPIVersionIn, out *api.SetAPIVersionOut) error {
 	if args.APIVersion < 2 {
 		args.APIVersion = 1

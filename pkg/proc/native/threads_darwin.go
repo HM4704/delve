@@ -1,4 +1,5 @@
-//+build darwin,macnative
+//go:build darwin && macnative
+// +build darwin,macnative
 
 package native
 
@@ -13,6 +14,7 @@ import (
 	sys "golang.org/x/sys/unix"
 
 	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/amd64util"
 )
 
 // waitStatus is a synonym for the platform-specific WaitStatus
@@ -85,32 +87,13 @@ func (t *nativeThread) resume() error {
 	return nil
 }
 
-func (t *nativeThread) Blocked() bool {
-	// TODO(dp) cache the func pc to remove this lookup
-	regs, err := t.Registers()
-	if err != nil {
-		return false
-	}
-	pc := regs.PC()
-	fn := t.BinInfo().PCToFunc(pc)
-	if fn == nil {
-		return false
-	}
-	switch fn.Name {
-	case "runtime.kevent", "runtime.mach_semaphore_wait", "runtime.usleep", "runtime.mach_semaphore_timedwait":
-		return true
-	default:
-		return false
-	}
-}
-
 // Stopped returns whether the thread is stopped at
 // the operating system level.
 func (t *nativeThread) Stopped() bool {
 	return C.thread_blocked(t.os.threadAct) > C.int(0)
 }
 
-func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (int, error) {
+func (t *nativeThread) WriteMemory(addr uint64, data []byte) (int, error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
@@ -128,7 +111,7 @@ func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (int, error) {
 	return len(data), nil
 }
 
-func (t *nativeThread) ReadMemory(buf []byte, addr uintptr) (int, error) {
+func (t *nativeThread) ReadMemory(buf []byte, addr uint64) (int, error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
@@ -150,4 +133,13 @@ func (t *nativeThread) ReadMemory(buf []byte, addr uintptr) (int, error) {
 
 func (t *nativeThread) restoreRegisters(sr proc.Registers) error {
 	return errors.New("not implemented")
+}
+
+func (t *nativeThread) withDebugRegisters(f func(*amd64util.DebugRegisters) error) error {
+	return proc.ErrHWBreakUnsupported
+}
+
+// SoftExc returns true if this thread received a software exception during the last resume.
+func (t *nativeThread) SoftExc() bool {
+	return false
 }

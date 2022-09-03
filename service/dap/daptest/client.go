@@ -2,12 +2,17 @@
 // for DAP mode testing.
 package daptest
 
+//go:generate go run ./gen/main.go -o ./resp.go
+
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"testing"
 
 	"github.com/google/go-dap"
@@ -32,6 +37,12 @@ func NewClient(addr string) *Client {
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
+	return NewClientFromConn(conn)
+}
+
+// NewClientFromConn creates a new Client with the given TCP connection.
+// Call Close to close the connection.
+func NewClientFromConn(conn net.Conn) *Client {
 	c := &Client{conn: conn, reader: bufio.NewReader(conn)}
 	c.seq = 1 // match VS Code numbering
 	return c
@@ -50,231 +61,153 @@ func (c *Client) ReadMessage() (dap.Message, error) {
 	return dap.ReadProtocolMessage(c.reader)
 }
 
-func (c *Client) expectReadProtocolMessage(t *testing.T) dap.Message {
+func (c *Client) ExpectMessage(t *testing.T) dap.Message {
 	t.Helper()
 	m, err := dap.ReadProtocolMessage(c.reader)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	return m
 }
 
-func (c *Client) ExpectErrorResponse(t *testing.T) *dap.ErrorResponse {
+func (c *Client) ExpectInvisibleErrorResponse(t *testing.T) *dap.ErrorResponse {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ErrorResponse)
-}
-
-func (c *Client) expectErrorResponse(t *testing.T, id int, message string) *dap.ErrorResponse {
-	t.Helper()
-	er := c.expectReadProtocolMessage(t).(*dap.ErrorResponse)
-	if er.Body.Error.Id != id || er.Message != message {
-		t.Errorf("\ngot %#v\nwant Id=%d Message=%q", er, id, message)
+	er := c.ExpectErrorResponse(t)
+	if er.Body.Error.ShowUser {
+		t.Errorf("\ngot %#v\nwant ShowUser=false", er)
 	}
 	return er
 }
 
-func (c *Client) ExpectNotYetImplementedErrorResponse(t *testing.T) *dap.ErrorResponse {
+func (c *Client) ExpectVisibleErrorResponse(t *testing.T) *dap.ErrorResponse {
 	t.Helper()
-	return c.expectErrorResponse(t, 7777, "Not yet implemented")
+	er := c.ExpectErrorResponse(t)
+	if !er.Body.Error.ShowUser {
+		t.Errorf("\ngot %#v\nwant ShowUser=true", er)
+	}
+	return er
 }
 
-func (c *Client) ExpectUnsupportedCommandErrorResponse(t *testing.T) *dap.ErrorResponse {
+func (c *Client) ExpectErrorResponseWith(t *testing.T, id int, message string, showUser bool) *dap.ErrorResponse {
 	t.Helper()
-	return c.expectErrorResponse(t, 9999, "Unsupported command")
+	er := c.ExpectErrorResponse(t)
+	if matched, _ := regexp.MatchString(message, er.Body.Error.Format); !matched || er.Body.Error.Id != id || er.Body.Error.ShowUser != showUser {
+		t.Errorf("got %#v, want Id=%d Format=%q ShowUser=%v", er, id, message, showUser)
+	}
+	return er
 }
 
-func (c *Client) ExpectDisconnectResponse(t *testing.T) *dap.DisconnectResponse {
+func (c *Client) ExpectInitializeResponseAndCapabilities(t *testing.T) *dap.InitializeResponse {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.DisconnectResponse)
-}
-
-func (c *Client) ExpectContinueResponse(t *testing.T) *dap.ContinueResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ContinueResponse)
-}
-
-func (c *Client) ExpectNextResponse(t *testing.T) *dap.NextResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.NextResponse)
-}
-
-func (c *Client) ExpectStepInResponse(t *testing.T) *dap.StepInResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.StepInResponse)
-}
-
-func (c *Client) ExpectStepOutResponse(t *testing.T) *dap.StepOutResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.StepOutResponse)
-}
-
-func (c *Client) ExpectTerminatedEvent(t *testing.T) *dap.TerminatedEvent {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.TerminatedEvent)
-}
-
-func (c *Client) ExpectInitializeResponse(t *testing.T) *dap.InitializeResponse {
-	t.Helper()
-	initResp := c.expectReadProtocolMessage(t).(*dap.InitializeResponse)
-	if !initResp.Body.SupportsConfigurationDoneRequest {
-		t.Errorf("got %#v, want SupportsConfigurationDoneRequest=true", initResp)
+	initResp := c.ExpectInitializeResponse(t)
+	wantCapabilities := dap.Capabilities{
+		// the values set by dap.(*Server).onInitializeRequest.
+		SupportsConfigurationDoneRequest: true,
+		SupportsConditionalBreakpoints:   true,
+		SupportsDelayedStackTraceLoading: true,
+		SupportsExceptionInfoRequest:     true,
+		SupportsSetVariable:              true,
+		SupportsFunctionBreakpoints:      true,
+		SupportsInstructionBreakpoints:   true,
+		SupportsEvaluateForHovers:        true,
+		SupportsClipboardContext:         true,
+		SupportsSteppingGranularity:      true,
+		SupportsLogPoints:                true,
+		SupportsDisassembleRequest:       true,
+	}
+	if !reflect.DeepEqual(initResp.Body, wantCapabilities) {
+		t.Errorf("capabilities in initializeResponse: got %+v, want %v", pretty(initResp.Body), pretty(wantCapabilities))
 	}
 	return initResp
 }
 
-func (c *Client) ExpectInitializedEvent(t *testing.T) *dap.InitializedEvent {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.InitializedEvent)
+func pretty(v interface{}) string {
+	s, _ := json.MarshalIndent(v, "", "\t")
+	return string(s)
 }
 
-func (c *Client) ExpectLaunchResponse(t *testing.T) *dap.LaunchResponse {
+func (c *Client) ExpectNotYetImplementedErrorResponse(t *testing.T) *dap.ErrorResponse {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.LaunchResponse)
+	return c.ExpectErrorResponseWith(t, 7777, "Not yet implemented", false)
 }
 
-func (c *Client) ExpectSetExceptionBreakpointsResponse(t *testing.T) *dap.SetExceptionBreakpointsResponse {
+func (c *Client) ExpectUnsupportedCommandErrorResponse(t *testing.T) *dap.ErrorResponse {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.SetExceptionBreakpointsResponse)
+	return c.ExpectErrorResponseWith(t, 9999, "Unsupported command", false)
 }
 
-func (c *Client) ExpectSetBreakpointsResponse(t *testing.T) *dap.SetBreakpointsResponse {
+func (c *Client) ExpectCapabilitiesEventSupportTerminateDebuggee(t *testing.T) *dap.CapabilitiesEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.SetBreakpointsResponse)
+	e := c.ExpectCapabilitiesEvent(t)
+	if !e.Body.Capabilities.SupportTerminateDebuggee {
+		t.Errorf("\ngot %#v\nwant SupportTerminateDebuggee=true", e.Body.Capabilities.SupportTerminateDebuggee)
+	}
+	return e
 }
 
-func (c *Client) ExpectStoppedEvent(t *testing.T) *dap.StoppedEvent {
+func (c *Client) ExpectOutputEventRegex(t *testing.T, want string) *dap.OutputEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.StoppedEvent)
+	e := c.ExpectOutputEvent(t)
+	if matched, _ := regexp.MatchString(want, e.Body.Output); !matched {
+		t.Errorf("\ngot %#v\nwant Output=%q", e, want)
+	}
+	return e
 }
 
-func (c *Client) ExpectOutputEvent(t *testing.T) *dap.OutputEvent {
+const ProcessExited = `Process [0-9]+ has exited with status %s\n`
+
+func (c *Client) ExpectOutputEventProcessExited(t *testing.T, status int) *dap.OutputEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.OutputEvent)
+	// We sometimes fail to return the correct exit status on Linux, so allow -1 here as well.
+	return c.ExpectOutputEventRegex(t, fmt.Sprintf(ProcessExited, fmt.Sprintf("(%d|-1)", status)))
 }
 
-func (c *Client) ExpectConfigurationDoneResponse(t *testing.T) *dap.ConfigurationDoneResponse {
+func (c *Client) ExpectOutputEventProcessExitedAnyStatus(t *testing.T) *dap.OutputEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ConfigurationDoneResponse)
+	return c.ExpectOutputEventRegex(t, fmt.Sprintf(ProcessExited, `-?\d+`))
 }
 
-func (c *Client) ExpectThreadsResponse(t *testing.T) *dap.ThreadsResponse {
+func (c *Client) ExpectOutputEventDetaching(t *testing.T) *dap.OutputEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ThreadsResponse)
+	return c.ExpectOutputEventRegex(t, `Detaching\n`)
 }
 
-func (c *Client) ExpectStackTraceResponse(t *testing.T) *dap.StackTraceResponse {
+func (c *Client) ExpectOutputEventDetachingKill(t *testing.T) *dap.OutputEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.StackTraceResponse)
+	return c.ExpectOutputEventRegex(t, `Detaching and terminating target process\n`)
 }
 
-func (c *Client) ExpectScopesResponse(t *testing.T) *dap.ScopesResponse {
+func (c *Client) ExpectOutputEventDetachingNoKill(t *testing.T) *dap.OutputEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ScopesResponse)
+	return c.ExpectOutputEventRegex(t, `Detaching without terminating target process\n`)
 }
 
-func (c *Client) ExpectVariablesResponse(t *testing.T) *dap.VariablesResponse {
+func (c *Client) ExpectOutputEventTerminating(t *testing.T) *dap.OutputEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.VariablesResponse)
+	return c.ExpectOutputEventRegex(t, `Terminating process [0-9]+\n`)
 }
 
-func (c *Client) ExpectTerminateResponse(t *testing.T) *dap.TerminateResponse {
+const ClosingClient = "Closing client session, but leaving multi-client DAP server at .+:[0-9]+ with debuggee %s\n"
+
+func (c *Client) ExpectOutputEventClosingClient(t *testing.T, status string) *dap.OutputEvent {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.TerminateResponse)
+	return c.ExpectOutputEventRegex(t, fmt.Sprintf(ClosingClient, status))
 }
 
-func (c *Client) ExpectRestartResponse(t *testing.T) *dap.RestartResponse {
+func (c *Client) CheckStopLocation(t *testing.T, thread int, name string, line int) {
 	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.RestartResponse)
-}
-
-func (c *Client) ExpectSetFunctionBreakpointsResponse(t *testing.T) *dap.SetFunctionBreakpointsResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.SetFunctionBreakpointsResponse)
-}
-
-func (c *Client) ExpectStepBackResponse(t *testing.T) *dap.StepBackResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.StepBackResponse)
-}
-
-func (c *Client) ExpectReverseContinueResponse(t *testing.T) *dap.ReverseContinueResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ReverseContinueResponse)
-}
-
-func (c *Client) ExpectRestartFrameResponse(t *testing.T) *dap.RestartFrameResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.RestartFrameResponse)
-}
-
-func (c *Client) ExpectSetExpressionResponse(t *testing.T) *dap.SetExpressionResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.SetExpressionResponse)
-}
-
-func (c *Client) ExpectTerminateThreadsResponse(t *testing.T) *dap.TerminateThreadsResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.TerminateThreadsResponse)
-}
-
-func (c *Client) ExpectStepInTargetsResponse(t *testing.T) *dap.StepInTargetsResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.StepInTargetsResponse)
-}
-
-func (c *Client) ExpectGotoTargetsResponse(t *testing.T) *dap.GotoTargetsResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.GotoTargetsResponse)
-}
-
-func (c *Client) ExpectCompletionsResponse(t *testing.T) *dap.CompletionsResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.CompletionsResponse)
-}
-
-func (c *Client) ExpectExceptionInfoResponse(t *testing.T) *dap.ExceptionInfoResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ExceptionInfoResponse)
-}
-
-func (c *Client) ExpectLoadedSourcesResponse(t *testing.T) *dap.LoadedSourcesResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.LoadedSourcesResponse)
-}
-
-func (c *Client) ExpectDataBreakpointInfoResponse(t *testing.T) *dap.DataBreakpointInfoResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.DataBreakpointInfoResponse)
-}
-
-func (c *Client) ExpectSetDataBreakpointsResponse(t *testing.T) *dap.SetDataBreakpointsResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.SetDataBreakpointsResponse)
-}
-
-func (c *Client) ExpectReadMemoryResponse(t *testing.T) *dap.ReadMemoryResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ReadMemoryResponse)
-}
-
-func (c *Client) ExpectDisassembleResponse(t *testing.T) *dap.DisassembleResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.DisassembleResponse)
-}
-
-func (c *Client) ExpectCancelResponse(t *testing.T) *dap.CancelResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.CancelResponse)
-}
-
-func (c *Client) ExpectBreakpointLocationsResponse(t *testing.T) *dap.BreakpointLocationsResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.BreakpointLocationsResponse)
-}
-
-func (c *Client) ExpectModulesResponse(t *testing.T) *dap.ModulesResponse {
-	t.Helper()
-	return c.expectReadProtocolMessage(t).(*dap.ModulesResponse)
+	c.StackTraceRequest(thread, 0, 20)
+	st := c.ExpectStackTraceResponse(t)
+	if len(st.Body.StackFrames) < 1 {
+		t.Errorf("\ngot  %#v\nwant len(stackframes) => 1", st)
+	} else {
+		if line != -1 && st.Body.StackFrames[0].Line != line {
+			t.Errorf("\ngot  %#v\nwant Line=%d", st, line)
+		}
+		if st.Body.StackFrames[0].Name != name {
+			t.Errorf("\ngot  %#v\nwant Name=%q", st, name)
+		}
+	}
 }
 
 // InitializeRequest sends an 'initialize' request.
@@ -293,15 +226,27 @@ func (c *Client) InitializeRequest() {
 	c.send(request)
 }
 
+// InitializeRequestWithArgs sends an 'initialize' request with specified arguments.
+func (c *Client) InitializeRequestWithArgs(args dap.InitializeRequestArguments) {
+	request := &dap.InitializeRequest{Request: *c.newRequest("initialize")}
+	request.Arguments = args
+	c.send(request)
+}
+
+func toRawMessage(in interface{}) json.RawMessage {
+	out, _ := json.Marshal(in)
+	return out
+}
+
 // LaunchRequest sends a 'launch' request with the specified args.
-func (c *Client) LaunchRequest(mode string, program string, stopOnEntry bool) {
+func (c *Client) LaunchRequest(mode, program string, stopOnEntry bool) {
 	request := &dap.LaunchRequest{Request: *c.newRequest("launch")}
-	request.Arguments = map[string]interface{}{
+	request.Arguments = toRawMessage(map[string]interface{}{
 		"request":     "launch",
 		"mode":        mode,
 		"program":     program,
 		"stopOnEntry": stopOnEntry,
-	}
+	})
 	c.send(request)
 }
 
@@ -310,14 +255,15 @@ func (c *Client) LaunchRequest(mode string, program string, stopOnEntry bool) {
 // test for values of unexpected types or unspecified values.
 func (c *Client) LaunchRequestWithArgs(arguments map[string]interface{}) {
 	request := &dap.LaunchRequest{Request: *c.newRequest("launch")}
-	request.Arguments = arguments
+	request.Arguments = toRawMessage(arguments)
 	c.send(request)
 }
 
-// AttachRequest sends an 'attach' request.
-func (c *Client) AttachRequest() {
+// AttachRequest sends an 'attach' request with the specified
+// arguments.
+func (c *Client) AttachRequest(arguments map[string]interface{}) {
 	request := &dap.AttachRequest{Request: *c.newRequest("attach")}
-	// TODO(polina): populate meaningful arguments
+	request.Arguments = toRawMessage(arguments)
 	c.send(request)
 }
 
@@ -327,8 +273,22 @@ func (c *Client) DisconnectRequest() {
 	c.send(request)
 }
 
+// DisconnectRequestWithKillOption sends a 'disconnect' request with an option to specify
+// `terminateDebuggee`.
+func (c *Client) DisconnectRequestWithKillOption(kill bool) {
+	request := &dap.DisconnectRequest{Request: *c.newRequest("disconnect")}
+	request.Arguments.TerminateDebuggee = kill
+	c.send(request)
+}
+
 // SetBreakpointsRequest sends a 'setBreakpoints' request.
 func (c *Client) SetBreakpointsRequest(file string, lines []int) {
+	c.SetBreakpointsRequestWithArgs(file, lines, nil, nil, nil)
+}
+
+// SetBreakpointsRequestWithArgs sends a 'setBreakpoints' request with an option to
+// specify conditions, hit conditions, and log messages.
+func (c *Client) SetBreakpointsRequestWithArgs(file string, lines []int, conditions, hitConditions, logMessages map[int]string) {
 	request := &dap.SetBreakpointsRequest{Request: *c.newRequest("setBreakpoints")}
 	request.Arguments = dap.SetBreakpointsArguments{
 		Source: dap.Source{
@@ -336,10 +296,18 @@ func (c *Client) SetBreakpointsRequest(file string, lines []int) {
 			Path: file,
 		},
 		Breakpoints: make([]dap.SourceBreakpoint, len(lines)),
-		//sourceModified: false,
 	}
 	for i, l := range lines {
 		request.Arguments.Breakpoints[i].Line = l
+		if cond, ok := conditions[l]; ok {
+			request.Arguments.Breakpoints[i].Condition = cond
+		}
+		if hitCond, ok := hitConditions[l]; ok {
+			request.Arguments.Breakpoints[i].HitCondition = hitCond
+		}
+		if logMessage, ok := logMessages[l]; ok {
+			request.Arguments.Breakpoints[i].LogMessage = logMessage
+		}
 	}
 	c.send(request)
 }
@@ -370,24 +338,48 @@ func (c *Client) NextRequest(thread int) {
 	c.send(request)
 }
 
+// NextInstructionRequest sends a 'next' request with granularity 'instruction'.
+func (c *Client) NextInstructionRequest(thread int) {
+	request := &dap.NextRequest{Request: *c.newRequest("next")}
+	request.Arguments.ThreadId = thread
+	request.Arguments.Granularity = "instruction"
+	c.send(request)
+}
+
 // StepInRequest sends a 'stepIn' request.
 func (c *Client) StepInRequest(thread int) {
-	request := &dap.NextRequest{Request: *c.newRequest("stepIn")}
+	request := &dap.StepInRequest{Request: *c.newRequest("stepIn")}
 	request.Arguments.ThreadId = thread
+	c.send(request)
+}
+
+// StepInInstructionRequest sends a 'stepIn' request with granularity 'instruction'.
+func (c *Client) StepInInstructionRequest(thread int) {
+	request := &dap.StepInRequest{Request: *c.newRequest("stepIn")}
+	request.Arguments.ThreadId = thread
+	request.Arguments.Granularity = "instruction"
 	c.send(request)
 }
 
 // StepOutRequest sends a 'stepOut' request.
 func (c *Client) StepOutRequest(thread int) {
-	request := &dap.NextRequest{Request: *c.newRequest("stepOut")}
+	request := &dap.StepOutRequest{Request: *c.newRequest("stepOut")}
 	request.Arguments.ThreadId = thread
 	c.send(request)
 }
 
+// StepOutInstructionRequest sends a 'stepOut' request with granularity 'instruction'.
+func (c *Client) StepOutInstructionRequest(thread int) {
+	request := &dap.StepOutRequest{Request: *c.newRequest("stepOut")}
+	request.Arguments.ThreadId = thread
+	request.Arguments.Granularity = "instruction"
+	c.send(request)
+}
+
 // PauseRequest sends a 'pause' request.
-func (c *Client) PauseRequest() {
-	request := &dap.NextRequest{Request: *c.newRequest("pause")}
-	// TODO(polina): arguments
+func (c *Client) PauseRequest(threadId int) {
+	request := &dap.PauseRequest{Request: *c.newRequest("pause")}
+	request.Arguments.ThreadId = threadId
 	c.send(request)
 }
 
@@ -420,7 +412,25 @@ func (c *Client) VariablesRequest(variablesReference int) {
 	c.send(request)
 }
 
-// TeriminateRequest sends a 'terminate' request.
+// IndexedVariablesRequest sends a 'variables' request.
+func (c *Client) IndexedVariablesRequest(variablesReference, start, count int) {
+	request := &dap.VariablesRequest{Request: *c.newRequest("variables")}
+	request.Arguments.VariablesReference = variablesReference
+	request.Arguments.Filter = "indexed"
+	request.Arguments.Start = start
+	request.Arguments.Count = count
+	c.send(request)
+}
+
+// NamedVariablesRequest sends a 'variables' request.
+func (c *Client) NamedVariablesRequest(variablesReference int) {
+	request := &dap.VariablesRequest{Request: *c.newRequest("variables")}
+	request.Arguments.VariablesReference = variablesReference
+	request.Arguments.Filter = "named"
+	c.send(request)
+}
+
+// TerminateRequest sends a 'terminate' request.
 func (c *Client) TerminateRequest() {
 	c.send(&dap.TerminateRequest{Request: *c.newRequest("terminate")})
 }
@@ -431,8 +441,23 @@ func (c *Client) RestartRequest() {
 }
 
 // SetFunctionBreakpointsRequest sends a 'setFunctionBreakpoints' request.
-func (c *Client) SetFunctionBreakpointsRequest() {
-	c.send(&dap.SetFunctionBreakpointsRequest{Request: *c.newRequest("setFunctionBreakpoints")})
+func (c *Client) SetFunctionBreakpointsRequest(breakpoints []dap.FunctionBreakpoint) {
+	c.send(&dap.SetFunctionBreakpointsRequest{
+		Request: *c.newRequest("setFunctionBreakpoints"),
+		Arguments: dap.SetFunctionBreakpointsArguments{
+			Breakpoints: breakpoints,
+		},
+	})
+}
+
+// SetInstructionBreakpointsRequest sends a 'setInstructionBreakpoints' request.
+func (c *Client) SetInstructionBreakpointsRequest(breakpoints []dap.InstructionBreakpoint) {
+	c.send(&dap.SetInstructionBreakpointsRequest{
+		Request: *c.newRequest("setInstructionBreakpoints"),
+		Arguments: dap.SetInstructionBreakpointsArguments{
+			Breakpoints: breakpoints,
+		},
+	})
 }
 
 // StepBackRequest sends a 'stepBack' request.
@@ -446,8 +471,12 @@ func (c *Client) ReverseContinueRequest() {
 }
 
 // SetVariableRequest sends a 'setVariable' request.
-func (c *Client) SetVariableRequest() {
-	c.send(&dap.ReverseContinueRequest{Request: *c.newRequest("setVariable")})
+func (c *Client) SetVariableRequest(variablesRef int, name, value string) {
+	request := &dap.SetVariableRequest{Request: *c.newRequest("setVariable")}
+	request.Arguments.VariablesReference = variablesRef
+	request.Arguments.Name = name
+	request.Arguments.Value = value
+	c.send(request)
 }
 
 // RestartFrameRequest sends a 'restartFrame' request.
@@ -476,8 +505,12 @@ func (c *Client) TerminateThreadsRequest() {
 }
 
 // EvaluateRequest sends a 'evaluate' request.
-func (c *Client) EvaluateRequest() {
-	c.send(&dap.EvaluateRequest{Request: *c.newRequest("evaluate")})
+func (c *Client) EvaluateRequest(expr string, fid int, context string) {
+	request := &dap.EvaluateRequest{Request: *c.newRequest("evaluate")}
+	request.Arguments.Expression = expr
+	request.Arguments.FrameId = fid
+	request.Arguments.Context = context
+	c.send(request)
 }
 
 // StepInTargetsRequest sends a 'stepInTargets' request.
@@ -496,8 +529,10 @@ func (c *Client) CompletionsRequest() {
 }
 
 // ExceptionInfoRequest sends a 'exceptionInfo' request.
-func (c *Client) ExceptionInfoRequest() {
-	c.send(&dap.ExceptionInfoRequest{Request: *c.newRequest("exceptionInfo")})
+func (c *Client) ExceptionInfoRequest(threadID int) {
+	request := &dap.ExceptionInfoRequest{Request: *c.newRequest("exceptionInfo")}
+	request.Arguments.ThreadId = threadID
+	c.send(request)
 }
 
 // LoadedSourcesRequest sends a 'loadedSources' request.
@@ -521,8 +556,17 @@ func (c *Client) ReadMemoryRequest() {
 }
 
 // DisassembleRequest sends a 'disassemble' request.
-func (c *Client) DisassembleRequest() {
-	c.send(&dap.DisassembleRequest{Request: *c.newRequest("disassemble")})
+func (c *Client) DisassembleRequest(memoryReference string, instructionOffset, inctructionCount int) {
+	c.send(&dap.DisassembleRequest{
+		Request: *c.newRequest("disassemble"),
+		Arguments: dap.DisassembleArguments{
+			MemoryReference:   memoryReference,
+			Offset:            0,
+			InstructionOffset: instructionOffset,
+			InstructionCount:  inctructionCount,
+			ResolveSymbols:    false,
+		},
+	})
 }
 
 // CancelRequest sends a 'cancel' request.
@@ -553,6 +597,15 @@ func (c *Client) UnknownEvent() {
 	event.Seq = -1
 	event.Event = "unknown"
 	c.send(event)
+}
+
+// BadRequest triggers an unmarshal error.
+func (c *Client) BadRequest() {
+	content := []byte("{malformedString}")
+	contentLengthHeaderFmt := "Content-Length: %d\r\n\r\n"
+	header := fmt.Sprintf(contentLengthHeaderFmt, len(content))
+	c.conn.Write([]byte(header))
+	c.conn.Write(content)
 }
 
 // KnownEvent passes decode checks, but delve has no 'case' to

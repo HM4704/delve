@@ -3,8 +3,11 @@ package rpc2
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
+	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
 	"github.com/go-delve/delve/service/debugger"
@@ -55,12 +58,7 @@ type DetachOut struct {
 
 // Detach detaches the debugger, optionally killing the process.
 func (s *RPCServer) Detach(arg DetachIn, out *DetachOut) error {
-	err := s.debugger.Detach(arg.Kill)
-	if s.config.DisconnectChan != nil {
-		close(s.config.DisconnectChan)
-		s.config.DisconnectChan = nil
-	}
-	return err
+	return s.debugger.Detach(arg.Kill)
 }
 
 type RestartIn struct {
@@ -89,6 +87,7 @@ type RestartOut struct {
 
 // Restart restarts program.
 func (s *RPCServer) Restart(arg RestartIn, cb service.RPCCallback) {
+	close(cb.SetupDoneChan())
 	if s.config.Debugger.AttachPid != 0 {
 		cb.Return(nil, errors.New("cannot restart process Delve did not create"))
 		return
@@ -110,6 +109,7 @@ type StateOut struct {
 
 // State returns the current debugger state.
 func (s *RPCServer) State(arg StateIn, cb service.RPCCallback) {
+	close(cb.SetupDoneChan())
 	var out StateOut
 	st, err := s.debugger.State(arg.NonBlocking)
 	if err != nil {
@@ -126,7 +126,7 @@ type CommandOut struct {
 
 // Command interrupts, continues and steps through the program.
 func (s *RPCServer) Command(command api.DebuggerCommand, cb service.RPCCallback) {
-	st, err := s.debugger.Command(&command)
+	st, err := s.debugger.Command(&command, cb.SetupDoneChan())
 	if err != nil {
 		cb.Return(nil, err)
 		return
@@ -134,6 +134,18 @@ func (s *RPCServer) Command(command api.DebuggerCommand, cb service.RPCCallback)
 	var out CommandOut
 	out.State = *st
 	cb.Return(out, nil)
+}
+
+type GetBufferedTracepointsIn struct {
+}
+
+type GetBufferedTracepointsOut struct {
+	TracepointResults []api.TracepointResult
+}
+
+func (s *RPCServer) GetBufferedTracepoints(arg GetBufferedTracepointsIn, out *GetBufferedTracepointsOut) error {
+	out.TracepointResults = s.debugger.GetBufferedTracepoints()
+	return nil
 }
 
 type GetBreakpointIn struct {
@@ -164,7 +176,7 @@ func (s *RPCServer) GetBreakpoint(arg GetBreakpointIn, out *GetBreakpointOut) er
 }
 
 type StacktraceIn struct {
-	Id     int
+	Id     int64
 	Depth  int
 	Full   bool
 	Defers bool // read deferred functions (equivalent to passing StacktraceReadDefers in Opts)
@@ -189,12 +201,16 @@ func (s *RPCServer) Stacktrace(arg StacktraceIn, out *StacktraceOut) error {
 		arg.Opts |= api.StacktraceReadDefers
 	}
 	var err error
-	out.Locations, err = s.debugger.Stacktrace(arg.Id, arg.Depth, arg.Opts, api.LoadConfigToProc(cfg))
+	rawlocs, err := s.debugger.Stacktrace(arg.Id, arg.Depth, arg.Opts)
+	if err != nil {
+		return err
+	}
+	out.Locations, err = s.debugger.ConvertStacktrace(rawlocs, api.LoadConfigToProc(cfg))
 	return err
 }
 
 type AncestorsIn struct {
-	GoroutineID  int
+	GoroutineID  int64
 	NumAncestors int
 	Depth        int
 }
@@ -211,6 +227,7 @@ func (s *RPCServer) Ancestors(arg AncestorsIn, out *AncestorsOut) error {
 }
 
 type ListBreakpointsIn struct {
+	All bool
 }
 
 type ListBreakpointsOut struct {
@@ -219,7 +236,7 @@ type ListBreakpointsOut struct {
 
 // ListBreakpoints gets all breakpoints.
 func (s *RPCServer) ListBreakpoints(arg ListBreakpointsIn, out *ListBreakpointsOut) error {
-	out.Breakpoints = s.debugger.Breakpoints()
+	out.Breakpoints = s.debugger.Breakpoints(arg.All)
 	return nil
 }
 
@@ -231,26 +248,32 @@ type CreateBreakpointOut struct {
 	Breakpoint api.Breakpoint
 }
 
-// CreateBreakpoint creates a new breakpoint.
-//
-// - If arg.Breakpoint.File is not an empty string the breakpoint
-// will be created on the specified file:line location
-//
-// - If arg.Breakpoint.FunctionName is not an empty string
-// the breakpoint will be created on the specified function:line
-// location.
-//
-// - If arg.Breakpoint.Addrs is filled it will create a logical breakpoint
-// corresponding to all specified addresses.
-//
-// - Otherwise the value specified by arg.Breakpoint.Addr will be used.
+// CreateBreakpoint creates a new breakpoint. The client is expected to populate `CreateBreakpointIn`
+// with an `api.Breakpoint` struct describing where to set the breakpoing. For more information on
+// how to properly request a breakpoint via the `api.Breakpoint` struct see the documentation for
+// `debugger.CreateBreakpoint` here: https://pkg.go.dev/github.com/go-delve/delve/service/debugger#Debugger.CreateBreakpoint.
 func (s *RPCServer) CreateBreakpoint(arg CreateBreakpointIn, out *CreateBreakpointOut) error {
+	if err := api.ValidBreakpointName(arg.Breakpoint.Name); err != nil {
+		return err
+	}
 	createdbp, err := s.debugger.CreateBreakpoint(&arg.Breakpoint)
 	if err != nil {
 		return err
 	}
 	out.Breakpoint = *createdbp
 	return nil
+}
+
+type CreateEBPFTracepointIn struct {
+	FunctionName string
+}
+
+type CreateEBPFTracepointOut struct {
+	Breakpoint api.Breakpoint
+}
+
+func (s *RPCServer) CreateEBPFTracepoint(arg CreateEBPFTracepointIn, out *CreateEBPFTracepointOut) error {
+	return s.debugger.CreateEBPFTracepoint(arg.FunctionName)
 }
 
 type ClearBreakpointIn struct {
@@ -285,6 +308,41 @@ func (s *RPCServer) ClearBreakpoint(arg ClearBreakpointIn, out *ClearBreakpointO
 	return nil
 }
 
+type ToggleBreakpointIn struct {
+	Id   int
+	Name string
+}
+
+type ToggleBreakpointOut struct {
+	Breakpoint *api.Breakpoint
+}
+
+// ToggleBreakpoint toggles on or off a breakpoint by Name (if Name is not an
+// empty string) or by ID.
+func (s *RPCServer) ToggleBreakpoint(arg ToggleBreakpointIn, out *ToggleBreakpointOut) error {
+	var bp *api.Breakpoint
+	if arg.Name != "" {
+		bp = s.debugger.FindBreakpointByName(arg.Name)
+		if bp == nil {
+			return fmt.Errorf("no breakpoint with name %s", arg.Name)
+		}
+	} else {
+		bp = s.debugger.FindBreakpoint(arg.Id)
+		if bp == nil {
+			return fmt.Errorf("no breakpoint with id %d", arg.Id)
+		}
+	}
+	bp.Disabled = !bp.Disabled
+	if err := api.ValidBreakpointName(bp.Name); err != nil {
+		return err
+	}
+	if err := s.debugger.AmendBreakpoint(bp); err != nil {
+		return err
+	}
+	out.Breakpoint = bp
+	return nil
+}
+
 type AmendBreakpointIn struct {
 	Breakpoint api.Breakpoint
 }
@@ -298,6 +356,9 @@ type AmendBreakpointOut struct {
 //
 // arg.Breakpoint.ID must be a valid breakpoint ID
 func (s *RPCServer) AmendBreakpoint(arg AmendBreakpointIn, out *AmendBreakpointOut) error {
+	if err := api.ValidBreakpointName(arg.Breakpoint.Name); err != nil {
+		return err
+	}
 	return s.debugger.AmendBreakpoint(&arg.Breakpoint)
 }
 
@@ -320,8 +381,14 @@ type ListThreadsOut struct {
 
 // ListThreads lists all threads.
 func (s *RPCServer) ListThreads(arg ListThreadsIn, out *ListThreadsOut) (err error) {
-	out.Threads, err = s.debugger.Threads()
-	return err
+	threads, err := s.debugger.Threads()
+	if err != nil {
+		return err
+	}
+	s.debugger.LockTarget()
+	defer s.debugger.UnlockTarget()
+	out.Threads = api.ConvertThreads(threads, s.debugger.ConvertThreadBreakpoint)
+	return nil
 }
 
 type GetThreadIn struct {
@@ -341,7 +408,9 @@ func (s *RPCServer) GetThread(arg GetThreadIn, out *GetThreadOut) error {
 	if t == nil {
 		return fmt.Errorf("no thread with id %d", arg.Id)
 	}
-	out.Thread = t
+	s.debugger.LockTarget()
+	defer s.debugger.UnlockTarget()
+	out.Thread = api.ConvertThread(t, s.debugger.ConvertThreadBreakpoint(t))
 	return nil
 }
 
@@ -356,21 +425,11 @@ type ListPackageVarsOut struct {
 
 // ListPackageVars lists all package variables in the context of the current thread.
 func (s *RPCServer) ListPackageVars(arg ListPackageVarsIn, out *ListPackageVarsOut) error {
-	state, err := s.debugger.State(false)
+	vars, err := s.debugger.PackageVariables(arg.Filter, *api.LoadConfigToProc(&arg.Cfg))
 	if err != nil {
 		return err
 	}
-
-	current := state.CurrentThread
-	if current == nil {
-		return fmt.Errorf("no current thread")
-	}
-
-	vars, err := s.debugger.PackageVariables(current.ID, arg.Filter, *api.LoadConfigToProc(&arg.Cfg))
-	if err != nil {
-		return err
-	}
-	out.Variables = vars
+	out.Variables = api.ConvertVars(vars)
 	return nil
 }
 
@@ -397,11 +456,18 @@ func (s *RPCServer) ListRegisters(arg ListRegistersIn, out *ListRegistersOut) er
 		arg.ThreadID = state.CurrentThread.ID
 	}
 
-	regs, err := s.debugger.Registers(arg.ThreadID, arg.Scope, arg.IncludeFp)
+	var regs *op.DwarfRegisters
+	var err error
+
+	if arg.Scope != nil {
+		regs, err = s.debugger.ScopeRegisters(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, arg.IncludeFp)
+	} else {
+		regs, err = s.debugger.ThreadRegisters(arg.ThreadID, arg.IncludeFp)
+	}
 	if err != nil {
 		return err
 	}
-	out.Regs = regs
+	out.Regs = api.ConvertRegisters(regs, s.debugger.DwarfRegisterToString, arg.IncludeFp)
 	out.Registers = out.Regs.String()
 
 	return nil
@@ -418,11 +484,11 @@ type ListLocalVarsOut struct {
 
 // ListLocalVars lists all local variables in scope.
 func (s *RPCServer) ListLocalVars(arg ListLocalVarsIn, out *ListLocalVarsOut) error {
-	vars, err := s.debugger.LocalVariables(arg.Scope, *api.LoadConfigToProc(&arg.Cfg))
+	vars, err := s.debugger.LocalVariables(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, *api.LoadConfigToProc(&arg.Cfg))
 	if err != nil {
 		return err
 	}
-	out.Variables = vars
+	out.Variables = api.ConvertVars(vars)
 	return nil
 }
 
@@ -437,11 +503,11 @@ type ListFunctionArgsOut struct {
 
 // ListFunctionArgs lists all arguments to the current function
 func (s *RPCServer) ListFunctionArgs(arg ListFunctionArgsIn, out *ListFunctionArgsOut) error {
-	vars, err := s.debugger.FunctionArguments(arg.Scope, *api.LoadConfigToProc(&arg.Cfg))
+	vars, err := s.debugger.FunctionArguments(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, *api.LoadConfigToProc(&arg.Cfg))
 	if err != nil {
 		return err
 	}
-	out.Args = vars
+	out.Args = api.ConvertVars(vars)
 	return nil
 }
 
@@ -455,20 +521,20 @@ type EvalOut struct {
 	Variable *api.Variable
 }
 
-// EvalVariable returns a variable in the specified context.
+// Eval returns a variable in the specified context.
 //
-// See https://github.com/go-delve/delve/wiki/Expressions for
-// a description of acceptable values of arg.Expr.
+// See https://github.com/go-delve/delve/blob/master/Documentation/cli/expr.md
+// for a description of acceptable values of arg.Expr.
 func (s *RPCServer) Eval(arg EvalIn, out *EvalOut) error {
 	cfg := arg.Cfg
 	if cfg == nil {
 		cfg = &api.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
 	}
-	v, err := s.debugger.EvalVariableInScope(arg.Scope, arg.Expr, *api.LoadConfigToProc(cfg))
+	v, err := s.debugger.EvalVariableInScope(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, arg.Expr, *api.LoadConfigToProc(cfg))
 	if err != nil {
 		return err
 	}
-	out.Variable = v
+	out.Variable = api.ConvertVar(v)
 	return nil
 }
 
@@ -484,7 +550,7 @@ type SetOut struct {
 // Set sets the value of a variable. Only numerical types and
 // pointers are currently supported.
 func (s *RPCServer) Set(arg SetIn, out *SetOut) error {
-	return s.debugger.SetVariableInScope(arg.Scope, arg.Symbol, arg.Value)
+	return s.debugger.SetVariableInScope(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, arg.Symbol, arg.Value)
 }
 
 type ListSourcesIn struct {
@@ -544,11 +610,16 @@ func (s *RPCServer) ListTypes(arg ListTypesIn, out *ListTypesOut) error {
 type ListGoroutinesIn struct {
 	Start int
 	Count int
+
+	Filters []api.ListGoroutinesFilter
+	api.GoroutineGroupingOptions
 }
 
 type ListGoroutinesOut struct {
-	Goroutines []*api.Goroutine
-	Nextg      int
+	Goroutines    []*api.Goroutine
+	Nextg         int
+	Groups        []api.GoroutineGroup
+	TooManyGroups bool
 }
 
 // ListGoroutines lists all goroutines.
@@ -557,12 +628,46 @@ type ListGoroutinesOut struct {
 // parameter, to get more goroutines from ListGoroutines.
 // Passing a value of Start that wasn't returned by ListGoroutines will skip
 // an undefined number of goroutines.
+//
+// If arg.Filters are specified the list of returned goroutines is filtered
+// applying the specified filters.
+// For example:
+//
+//	ListGoroutinesFilter{ Kind: ListGoroutinesFilterUserLoc, Negated: false, Arg: "afile.go" }
+//
+// will only return goroutines whose UserLoc contains "afile.go" as a substring.
+// More specifically a goroutine matches a location filter if the specified
+// location, formatted like this:
+//
+//	filename:lineno in function
+//
+// contains Arg[0] as a substring.
+//
+// Filters can also be applied to goroutine labels:
+//
+//	ListGoroutineFilter{ Kind: ListGoroutinesFilterLabel, Negated: false, Arg: "key=value" }
+//
+// this filter will only return goroutines that have a key=value label.
+//
+// If arg.GroupBy is not GoroutineFieldNone then the goroutines will
+// be grouped with the specified criterion.
+// If the value of arg.GroupBy is GoroutineLabel goroutines will
+// be grouped by the value of the label with key GroupByKey.
+// For each group a maximum of MaxExamples example goroutines are
+// returned, as well as the total number of goroutines in the group.
 func (s *RPCServer) ListGoroutines(arg ListGoroutinesIn, out *ListGoroutinesOut) error {
+	//TODO(aarzilli): if arg contains a running goroutines filter (not negated)
+	// and start == 0 and count == 0 then we can optimize this by just looking
+	// at threads directly.
 	gs, nextg, err := s.debugger.Goroutines(arg.Start, arg.Count)
 	if err != nil {
 		return err
 	}
-	out.Goroutines = gs
+	gs = s.debugger.FilterGoroutines(gs, arg.Filters)
+	gs, out.Groups, out.TooManyGroups = s.debugger.GroupGoroutines(gs, &arg.GoroutineGroupingOptions)
+	s.debugger.LockTarget()
+	defer s.debugger.UnlockTarget()
+	out.Goroutines = api.ConvertGoroutines(s.debugger.Target(), gs)
 	out.Nextg = nextg
 	return nil
 }
@@ -586,6 +691,13 @@ type FindLocationIn struct {
 	Scope                     api.EvalScope
 	Loc                       string
 	IncludeNonExecutableLines bool
+
+	// SubstitutePathRules is a slice of source code path substitution rules,
+	// the first entry of each pair is the path of a directory as it appears in
+	// the executable file (i.e. the location of a source file when the program
+	// was compiled), the second entry of each pair is the location of the same
+	// directory on the client system.
+	SubstitutePathRules [][2]string
 }
 
 type FindLocationOut struct {
@@ -594,20 +706,20 @@ type FindLocationOut struct {
 
 // FindLocation returns concrete location information described by a location expression.
 //
-//  loc ::= <filename>:<line> | <function>[:<line>] | /<regex>/ | (+|-)<offset> | <line> | *<address>
-//  * <filename> can be the full path of a file or just a suffix
-//  * <function> ::= <package>.<receiver type>.<name> | <package>.(*<receiver type>).<name> | <receiver type>.<name> | <package>.<name> | (*<receiver type>).<name> | <name>
-//  * <function> must be unambiguous
-//  * /<regex>/ will return a location for each function matched by regex
-//  * +<offset> returns a location for the line that is <offset> lines after the current line
-//  * -<offset> returns a location for the line that is <offset> lines before the current line
-//  * <line> returns a location for a line in the current file
-//  * *<address> returns the location corresponding to the specified address
+//	loc ::= <filename>:<line> | <function>[:<line>] | /<regex>/ | (+|-)<offset> | <line> | *<address>
+//	* <filename> can be the full path of a file or just a suffix
+//	* <function> ::= <package>.<receiver type>.<name> | <package>.(*<receiver type>).<name> | <receiver type>.<name> | <package>.<name> | (*<receiver type>).<name> | <name>
+//	  <function> must be unambiguous
+//	* /<regex>/ will return a location for each function matched by regex
+//	* +<offset> returns a location for the line that is <offset> lines after the current line
+//	* -<offset> returns a location for the line that is <offset> lines before the current line
+//	* <line> returns a location for a line in the current file
+//	* *<address> returns the location corresponding to the specified address
 //
 // NOTE: this function does not actually set breakpoints.
 func (c *RPCServer) FindLocation(arg FindLocationIn, out *FindLocationOut) error {
 	var err error
-	out.Locations, err = c.debugger.FindLocation(arg.Scope, arg.Loc, arg.IncludeNonExecutableLines)
+	out.Locations, err = c.debugger.FindLocation(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, arg.Loc, arg.IncludeNonExecutableLines, arg.SubstitutePathRules)
 	return err
 }
 
@@ -630,8 +742,15 @@ type DisassembleOut struct {
 // Disassemble will also try to calculate the destination address of an absolute indirect CALL if it happens to be the instruction the selected goroutine is stopped at.
 func (c *RPCServer) Disassemble(arg DisassembleIn, out *DisassembleOut) error {
 	var err error
-	out.Disassemble, err = c.debugger.Disassemble(arg.Scope.GoroutineID, arg.StartPC, arg.EndPC, arg.Flavour)
-	return err
+	insts, err := c.debugger.Disassemble(arg.Scope.GoroutineID, arg.StartPC, arg.EndPC)
+	if err != nil {
+		return err
+	}
+	out.Disassemble = make(api.AsmInstructions, len(insts))
+	for i := range insts {
+		out.Disassemble[i] = api.ConvertAsmInstruction(insts[i], c.debugger.AsmInstructionText(&insts[i], proc.AssemblyFlavour(arg.Flavour)))
+	}
+	return nil
 }
 
 type RecordedIn struct {
@@ -670,8 +789,15 @@ type ListCheckpointsOut struct {
 
 func (s *RPCServer) ListCheckpoints(arg ListCheckpointsIn, out *ListCheckpointsOut) error {
 	var err error
-	out.Checkpoints, err = s.debugger.Checkpoints()
-	return err
+	cps, err := s.debugger.Checkpoints()
+	if err != nil {
+		return err
+	}
+	out.Checkpoints = make([]api.Checkpoint, len(cps))
+	for i := range cps {
+		out.Checkpoints[i] = api.Checkpoint(cps[i])
+	}
+	return nil
 }
 
 type ClearCheckpointIn struct {
@@ -740,7 +866,11 @@ type ListDynamicLibrariesOut struct {
 }
 
 func (s *RPCServer) ListDynamicLibraries(in ListDynamicLibrariesIn, out *ListDynamicLibrariesOut) error {
-	out.List = s.debugger.ListDynamicLibraries()
+	imgs := s.debugger.ListDynamicLibraries()
+	out.List = make([]api.Image, 0, len(imgs))
+	for i := range imgs {
+		out.List = append(out.List, api.ConvertImage(imgs[i]))
+	}
 	return nil
 }
 
@@ -760,19 +890,39 @@ type ListPackagesBuildInfoOut struct {
 // Note that the directory path is a best guess and may be wrong is a tool
 // other than cmd/go is used to perform the build.
 func (s *RPCServer) ListPackagesBuildInfo(in ListPackagesBuildInfoIn, out *ListPackagesBuildInfoOut) error {
-	out.List = s.debugger.ListPackagesBuildInfo(in.IncludeFiles)
+	pkgs := s.debugger.ListPackagesBuildInfo(in.IncludeFiles)
+	out.List = make([]api.PackageBuildInfo, 0, len(pkgs))
+	for _, pkg := range pkgs {
+		var files []string
+
+		if len(pkg.Files) > 0 {
+			files = make([]string, 0, len(pkg.Files))
+			for file := range pkg.Files {
+				files = append(files, file)
+			}
+		}
+
+		sort.Strings(files)
+
+		out.List = append(out.List, api.PackageBuildInfo{
+			ImportPath:    pkg.ImportPath,
+			DirectoryPath: pkg.DirectoryPath,
+			Files:         files,
+		})
+	}
 	return nil
 }
 
 // ExamineMemoryIn holds the arguments of ExamineMemory
 type ExamineMemoryIn struct {
-	Address uintptr
+	Address uint64
 	Length  int
 }
 
 // ExaminedMemoryOut holds the return values of ExamineMemory
 type ExaminedMemoryOut struct {
-	Mem []byte
+	Mem            []byte
+	IsLittleEndian bool
 }
 
 func (s *RPCServer) ExamineMemory(arg ExamineMemoryIn, out *ExaminedMemoryOut) error {
@@ -785,6 +935,8 @@ func (s *RPCServer) ExamineMemory(arg ExamineMemoryIn, out *ExaminedMemoryOut) e
 	}
 
 	out.Mem = Mem
+	out.IsLittleEndian = true //TODO: get byte order from debugger.target.BinInfo().Arch
+
 	return nil
 }
 
@@ -795,6 +947,7 @@ type StopRecordingOut struct {
 }
 
 func (s *RPCServer) StopRecording(arg StopRecordingIn, cb service.RPCCallback) {
+	close(cb.SetupDoneChan())
 	var out StopRecordingOut
 	err := s.debugger.StopRecording()
 	if err != nil {
@@ -802,4 +955,77 @@ func (s *RPCServer) StopRecording(arg StopRecordingIn, cb service.RPCCallback) {
 		return
 	}
 	cb.Return(out, nil)
+}
+
+type DumpStartIn struct {
+	Destination string
+}
+
+type DumpStartOut struct {
+	State api.DumpState
+}
+
+// DumpStart starts a core dump to arg.Destination.
+func (s *RPCServer) DumpStart(arg DumpStartIn, out *DumpStartOut) error {
+	err := s.debugger.DumpStart(arg.Destination)
+	if err != nil {
+		return err
+	}
+	out.State = *api.ConvertDumpState(s.debugger.DumpWait(0))
+	return nil
+}
+
+type DumpWaitIn struct {
+	Wait int
+}
+
+type DumpWaitOut struct {
+	State api.DumpState
+}
+
+// DumpWait waits for the core dump to finish or for arg.Wait milliseconds.
+// Wait == 0 means return immediately.
+// Returns the core dump status
+func (s *RPCServer) DumpWait(arg DumpWaitIn, out *DumpWaitOut) error {
+	out.State = *api.ConvertDumpState(s.debugger.DumpWait(time.Duration(arg.Wait) * time.Millisecond))
+	return nil
+}
+
+type DumpCancelIn struct {
+}
+
+type DumpCancelOut struct {
+}
+
+// DumpCancel cancels the core dump.
+func (s *RPCServer) DumpCancel(arg DumpCancelIn, out *DumpCancelOut) error {
+	return s.debugger.DumpCancel()
+}
+
+type CreateWatchpointIn struct {
+	Scope api.EvalScope
+	Expr  string
+	Type  api.WatchType
+}
+
+type CreateWatchpointOut struct {
+	*api.Breakpoint
+}
+
+func (s *RPCServer) CreateWatchpoint(arg CreateWatchpointIn, out *CreateWatchpointOut) error {
+	var err error
+	out.Breakpoint, err = s.debugger.CreateWatchpoint(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall, arg.Expr, arg.Type)
+	return err
+}
+
+type BuildIDIn struct {
+}
+
+type BuildIDOut struct {
+	BuildID string
+}
+
+func (s *RPCServer) BuildID(arg BuildIDIn, out *BuildIDOut) error {
+	out.BuildID = s.debugger.BuildID()
+	return nil
 }

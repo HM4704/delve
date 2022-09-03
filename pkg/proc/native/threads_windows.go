@@ -7,8 +7,9 @@ import (
 	sys "golang.org/x/sys/windows"
 
 	"github.com/go-delve/delve/pkg/proc"
-	"github.com/go-delve/delve/pkg/proc/winutil"
 )
+
+const enableHardwareBreakpoints = false // see https://github.com/go-delve/delve/issues/2768
 
 // waitStatus is a synonym for the platform-specific WaitStatus
 type waitStatus sys.WaitStatus
@@ -16,22 +17,25 @@ type waitStatus sys.WaitStatus
 // osSpecificDetails holds information specific to the Windows
 // operating system / kernel.
 type osSpecificDetails struct {
-	hThread syscall.Handle
+	hThread            syscall.Handle
+	dbgUiRemoteBreakIn bool // whether thread is an auxiliary DbgUiRemoteBreakIn thread created by Windows
+	delayErr           error
+	setbp              bool
 }
 
 func (t *nativeThread) singleStep() error {
-	context := winutil.NewCONTEXT()
-	context.ContextFlags = _CONTEXT_ALL
+	context := newContext()
+	context.SetFlags(_CONTEXT_ALL)
 
 	// Set the processor TRAP flag
-	err := _GetThreadContext(t.os.hThread, context)
+	err := t.getContext(context)
 	if err != nil {
 		return err
 	}
 
-	context.EFlags |= 0x100
+	context.SetTrap(true)
 
-	err = _SetThreadContext(t.os.hThread, context)
+	err = t.setContext(context)
 	if err != nil {
 		return err
 	}
@@ -77,9 +81,11 @@ func (t *nativeThread) singleStep() error {
 	}
 
 	for i := 0; i < suspendcnt; i++ {
-		_, err = _SuspendThread(t.os.hThread)
-		if err != nil {
-			return err
+		if !t.os.dbgUiRemoteBreakIn {
+			_, err = _SuspendThread(t.os.hThread)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -91,14 +97,14 @@ func (t *nativeThread) singleStep() error {
 	}
 
 	// Unset the processor TRAP flag
-	err = _GetThreadContext(t.os.hThread, context)
+	err = t.getContext(context)
 	if err != nil {
 		return err
 	}
 
-	context.EFlags &= ^uint32(0x100)
+	context.SetTrap(false)
 
-	return _SetThreadContext(t.os.hThread, context)
+	return t.setContext(context)
 }
 
 func (t *nativeThread) resume() error {
@@ -111,33 +117,13 @@ func (t *nativeThread) resume() error {
 	return err
 }
 
-func (t *nativeThread) Blocked() bool {
-	// TODO: Probably incorrect - what are the runtime functions that
-	// indicate blocking on Windows?
-	regs, err := t.Registers()
-	if err != nil {
-		return false
-	}
-	pc := regs.PC()
-	fn := t.BinInfo().PCToFunc(pc)
-	if fn == nil {
-		return false
-	}
-	switch fn.Name {
-	case "runtime.kevent", "runtime.usleep":
-		return true
-	default:
-		return false
-	}
-}
-
 // Stopped returns whether the thread is stopped at the operating system
 // level. On windows this always returns true.
 func (t *nativeThread) Stopped() bool {
 	return true
 }
 
-func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (int, error) {
+func (t *nativeThread) WriteMemory(addr uint64, data []byte) (int, error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
@@ -145,7 +131,7 @@ func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (int, error) {
 		return 0, nil
 	}
 	var count uintptr
-	err := _WriteProcessMemory(t.dbp.os.hProcess, addr, &data[0], uintptr(len(data)), &count)
+	err := _WriteProcessMemory(t.dbp.os.hProcess, uintptr(addr), &data[0], uintptr(len(data)), &count)
 	if err != nil {
 		return 0, err
 	}
@@ -154,7 +140,7 @@ func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (int, error) {
 
 var ErrShortRead = errors.New("short read")
 
-func (t *nativeThread) ReadMemory(buf []byte, addr uintptr) (int, error) {
+func (t *nativeThread) ReadMemory(buf []byte, addr uint64) (int, error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
@@ -162,13 +148,14 @@ func (t *nativeThread) ReadMemory(buf []byte, addr uintptr) (int, error) {
 		return 0, nil
 	}
 	var count uintptr
-	err := _ReadProcessMemory(t.dbp.os.hProcess, addr, &buf[0], uintptr(len(buf)), &count)
+	err := _ReadProcessMemory(t.dbp.os.hProcess, uintptr(addr), &buf[0], uintptr(len(buf)), &count)
 	if err == nil && count != uintptr(len(buf)) {
 		err = ErrShortRead
 	}
 	return int(count), err
 }
 
-func (t *nativeThread) restoreRegisters(savedRegs proc.Registers) error {
-	return _SetThreadContext(t.os.hThread, savedRegs.(*winutil.AMD64Registers).Context)
+// SoftExc returns true if this thread received a software exception during the last resume.
+func (t *nativeThread) SoftExc() bool {
+	return t.os.setbp
 }

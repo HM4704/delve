@@ -74,13 +74,17 @@ func fieldsOfStruct(typ types.Type) (fieldNames, fieldTypes []string) {
 func camelToDash(in string) string {
 	out := []rune{}
 	for i, ch := range in {
-		if ch < 'A' || ch > 'Z' {
-			out = append(out, ch)
-			continue
+		isupper := func(i int) bool {
+			ch := in[i]
+			return ch >= 'A' && ch <= 'Z'
 		}
 
-		if i != 0 {
-			out = append(out, '_')
+		if i > 0 && isupper(i) {
+			if !isupper(i - 1) {
+				out = append(out, '_')
+			} else if i+1 < len(in) && !isupper(i+1) {
+				out = append(out, '_')
+			}
 		}
 		out = append(out, unicode.ToLower(ch))
 	}
