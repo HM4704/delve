@@ -6,10 +6,12 @@ package proc
 
 import (
 	"bytes"
+
+	"github.com/go-delve/delve/pkg/dwarf/op"
 	"golang.org/x/arch/arm/armasm"
 )
 
-func armAsmDecode(asmInst *AsmInstruction, mem []byte, regs Registers, memrw MemoryReadWriter, bi *BinaryInfo) error {
+func armAsmDecode(asmInst *AsmInstruction, mem []byte, regs *op.DwarfRegisters, memrw MemoryReadWriter, bi *BinaryInfo) error {
 	asmInst.Size = 4
 	asmInst.Bytes = mem[:asmInst.Size]
 
@@ -52,7 +54,7 @@ func armAsmDecode(asmInst *AsmInstruction, mem []byte, regs Registers, memrw Mem
 	return nil
 }
 
-func resolveCallArgARM(inst *armasm.Inst, instAddr uint64, currentGoroutine bool, regs Registers, mem MemoryReadWriter, bininfo *BinaryInfo) *Location {
+func resolveCallArgARM(inst *armasm.Inst, instAddr uint64, currentGoroutine bool, regs *op.DwarfRegisters, mem MemoryReadWriter, bininfo *BinaryInfo) *Location {
 	switch inst.Op {
 	case armasm.BL, armasm.BLX, armasm.B, armasm.BX:
 		//ok
@@ -70,7 +72,7 @@ func resolveCallArgARM(inst *armasm.Inst, instAddr uint64, currentGoroutine bool
 		if !currentGoroutine || regs == nil {
 			return nil
 		}
-		pc, err = regs.Get(int(arg))
+		pc, err = bininfo.Arch.getAsmRegister(regs, int(arg))
 		if err != nil {
 			return nil
 		}

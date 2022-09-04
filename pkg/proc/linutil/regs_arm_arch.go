@@ -2,6 +2,7 @@ package linutil
 
 import (
 	"fmt"
+
 	"github.com/go-delve/delve/pkg/proc"
 	"golang.org/x/arch/arm/armasm"
 )
@@ -89,6 +90,11 @@ func (r *ARMRegisters) TLS() uint64 {
 // otherwise.
 func (r *ARMRegisters) GAddr() (uint64, bool) {
 	return uint64(r.Regs.Uregs[10]), true
+}
+
+// LR returns the link register.
+func (r *ARMRegisters) LR() uint64 {
+	return uint64(r.Regs.Uregs[14]) //?? correct value
 }
 
 // Get returns the value of the n-th register (in armasm order).

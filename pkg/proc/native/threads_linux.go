@@ -47,7 +47,7 @@ func (t *nativeThread) resumeWithSig(sig int) (err error) {
 	return
 }
 
-func (t *nativeThread) singleStep() (err error) {
+/* func (t *nativeThread) singleStep() (err error) {
 	sig := 0
 	for {
 		t.dbp.execPtraceFunc(func() { err = ptraceSingleStep(t.ID, sig) })
@@ -83,7 +83,7 @@ func (t *nativeThread) singleStep() (err error) {
 		}
 	}
 }
-
+*/
 func (t *nativeThread) WriteMemory(addr uint64, data []byte) (written int, err error) {
 	if t.dbp.exited {
 		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}

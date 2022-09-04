@@ -64,8 +64,8 @@ func linuxThreadsFromNotes(p *process, notes []*note, machineType elf.Machine) p
 				t := note.Desc.(*linuxPrStatusARM64)
 				lastThreadARM64 = &linuxARM64Thread{linutil.ARM64Registers{Regs: &t.Reg}, t}
 				p.Threads[int(t.Pid)] = &thread{lastThreadARM64, p, proc.CommonThread{}}
-				if p.currentThread == nil {
-					p.currentThread = p.Threads[int(t.Pid)]
+				if currentThread == nil {
+					currentThread = p.Threads[int(t.Pid)]
 				}
 			} else if machineType == _EM_ARM {
 				t := note.Desc.(*linuxPrStatusARM)

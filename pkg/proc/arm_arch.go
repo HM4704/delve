@@ -145,9 +145,9 @@ func armSwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool {
 			return true
 		case "crosscall2":
 			//The offsets get from runtime/cgo/asm_arm.s:10
-			newsp, _ := readUintRaw(it.mem, uintptr(it.regs.SP()+8*9+4*14), int64(it.bi.Arch.PtrSize()))
-			newbp, _ := readUintRaw(it.mem, uintptr(it.regs.SP()+4*11), int64(it.bi.Arch.PtrSize()))
-			newlr, _ := readUintRaw(it.mem, uintptr(it.regs.SP()+4*13), int64(it.bi.Arch.PtrSize()))
+			newsp, _ := readUintRaw(it.mem, uint64(it.regs.SP()+8*9+4*14), int64(it.bi.Arch.PtrSize()))
+			newbp, _ := readUintRaw(it.mem, uint64(it.regs.SP()+4*11), int64(it.bi.Arch.PtrSize()))
+			newlr, _ := readUintRaw(it.mem, uint64(it.regs.SP()+4*13), int64(it.bi.Arch.PtrSize()))
 			if it.regs.Reg(it.regs.BPRegNum) != nil {
 				it.regs.Reg(it.regs.BPRegNum).Uint64Val = uint64(newbp)
 			} else {
@@ -187,7 +187,7 @@ func armSwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool {
 		// switches from the goroutine stack to the system stack.
 		// Since we are unwinding the stack from callee to caller we have to switch
 		// from the system stack to the goroutine stack.
-		off, _ := readIntRaw(it.mem, uintptr(callFrameRegs.SP()+armCgocallSPOffsetSaveSlot), int64(it.bi.Arch.PtrSize()))
+		off, _ := readIntRaw(it.mem, uint64(callFrameRegs.SP()+armCgocallSPOffsetSaveSlot), int64(it.bi.Arch.PtrSize()))
 		oldsp := callFrameRegs.SP()
 		newsp := uint64(int64(it.stackhi) - off)
 
@@ -222,7 +222,7 @@ func armSwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool {
 		callFrameRegs.Reg(callFrameRegs.SPRegNum).Uint64Val = it.g0_sched_sp
 		// reads the previous value of g0.sched.sp that runtime.cgocallback_gofunc saved on the stack
 
-		it.g0_sched_sp, _ = readUintRaw(it.mem, uintptr(callFrameRegs.SP()+armPrevG0schedSPOffsetSaveSlot), int64(it.bi.Arch.PtrSize()))
+		it.g0_sched_sp, _ = readUintRaw(it.mem, uint64(callFrameRegs.SP()+armPrevG0schedSPOffsetSaveSlot), int64(it.bi.Arch.PtrSize()))
 		it.systemstack = true
 		return false
 	}
@@ -320,11 +320,11 @@ func maxArmDwarfRegister() int {
 	return max
 }
 
-func armRegistersToDwarfRegisters(staticBase uint64, regs Registers) op.DwarfRegisters {
+func armRegistersToDwarfRegisters(staticBase uint64, regs Registers) *op.DwarfRegisters {
 	dregs := initDwarfRegistersFromSlice(maxArmDwarfRegister(), regs, armNameToDwarf)
 	dr := op.NewDwarfRegisters(staticBase, dregs, binary.LittleEndian, armDwarfPCRegNum, armDwarfSPRegNum, armDwarfBPRegNum, armDwarfLRRegNum)
 	dr.SetLoadMoreCallback(loadMoreDwarfRegistersFromSliceFunc(dr, regs, armNameToDwarf))
-	return *dr
+	return dr
 }
 
 func armAddrAndStackRegsToDwarfRegisters(staticBase, pc, sp, bp, lr uint64) op.DwarfRegisters {
