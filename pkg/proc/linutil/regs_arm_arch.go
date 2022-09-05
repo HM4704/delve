@@ -5,6 +5,8 @@ import (
 
 	"github.com/go-delve/delve/pkg/proc"
 	"golang.org/x/arch/arm/armasm"
+	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
 )
 
 // Regs is a wrapper for sys.PtraceRegs.
@@ -132,6 +134,42 @@ func (r *ARMRegisters) Copy() (proc.Registers, error) {
 		copy(rr.Fpregset, r.Fpregset)
 	}
 	return &rr, nil
+}
+
+func (r *ARMRegisters) SetReg(regNum uint64, reg *op.DwarfRegister) (fpchanged bool, err error) {
+	switch regNum {
+	case regnum.ARM_PC:
+		//r.Regs.Pc = reg.Uint64Val
+		r.Regs.Uregs[15] = uint32(reg.Uint64Val)
+		return false, nil
+	case regnum.ARM_SP:
+		//r.Regs.Sp = reg.Uint64Val
+		r.Regs.Uregs[13] = uint32(reg.Uint64Val)
+		return false, nil
+	default:
+		switch {
+		case regNum >= regnum.ARM_X0 && regNum <= regnum.ARM_X0+30:
+			r.Regs.Uregs[regNum-regnum.ARM_X0] = uint32(reg.Uint64Val)
+			return false, nil
+
+		case regNum >= regnum.ARM_V0 && regNum <= regnum.ARM_V0+30:
+			if r.loadFpRegs != nil {
+				err := r.loadFpRegs(r)
+				r.loadFpRegs = nil
+				if err != nil {
+					return false, err
+				}
+			}
+
+			i := regNum - regnum.ARM_V0
+			reg.FillBytes()
+			copy(r.Fpregset[16*i:], reg.Bytes)
+			return true, nil
+
+		default:
+			return false, fmt.Errorf("changing register %d not implemented", regNum)
+		}
+	}
 }
 
 type ARMPtraceFpRegs struct {

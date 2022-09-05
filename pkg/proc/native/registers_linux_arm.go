@@ -8,6 +8,7 @@ import (
 
 	sys "golang.org/x/sys/unix"
 
+	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/linutil"
 )
@@ -55,7 +56,7 @@ func ptraceGetFpRegset(tid int) (fpregset []byte, err error) {
 }
 
 // SetPC sets PC to the value specified by 'pc'.
-func (thread *nativeThread) SetPC(pc uint64) error {
+func (thread *nativeThread) setPC(pc uint64) error {
 	ir, err := registers(thread)
 	if err != nil {
 		return err
@@ -64,6 +65,33 @@ func (thread *nativeThread) SetPC(pc uint64) error {
 	// PC = R15
 	r.Regs.Uregs[15] = uint32(pc)
 	thread.dbp.execPtraceFunc(func() { err = ptraceSetGRegs(thread.ID, r.Regs) })
+	return err
+}
+
+func (thread *nativeThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
+	ir, err := registers(thread)
+	if err != nil {
+		return err
+	}
+	r := ir.(*linutil.ARMRegisters)
+	fpchanged, err := r.SetReg(regNum, reg)
+	if err != nil {
+		return err
+	}
+
+	thread.dbp.execPtraceFunc(func() {
+		err = ptraceSetGRegs(thread.ID, r.Regs)
+		if err != syscall.Errno(0) && err != nil {
+			return
+		}
+		if fpchanged && r.Fpregset != nil {
+			iov := sys.Iovec{Base: &r.Fpregset[0], Len: uint32(len(r.Fpregset))}
+			_, _, err = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_SETREGSET, uintptr(thread.ID), uintptr(elf.NT_FPREGSET), uintptr(unsafe.Pointer(&iov)), 0, 0)
+		}
+	})
+	if err == syscall.Errno(0) {
+		err = nil
+	}
 	return err
 }
 

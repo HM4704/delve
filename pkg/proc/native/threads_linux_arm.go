@@ -235,3 +235,78 @@ func (t *nativeThread) singleStep() (err error) {
 		}
 	}
 }
+
+func (t *nativeThread) findHardwareBreakpoint() (*proc.Breakpoint, error) {
+/*	var siginfo ptraceSiginfoArm64
+	var err error
+	t.dbp.execPtraceFunc(func() {
+		_, _, err = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_GETSIGINFO, uintptr(t.ID), 0, uintptr(unsafe.Pointer(&siginfo)), 0, 0)
+	})
+	if err != syscall.Errno(0) {
+		return nil, err
+	}
+	if siginfo.signo != uint32(sys.SIGTRAP) || (siginfo.code&0xffff) != _TRAP_HWBKPT {
+		return nil, nil
+	}
+
+	for _, bp := range t.dbp.Breakpoints().M {
+		if bp.WatchType != 0 && siginfo.addr >= bp.Addr && siginfo.addr < bp.Addr+uint64(bp.WatchType.Size()) {
+			return bp, nil
+		}
+	}
+
+	return nil, fmt.Errorf("could not find hardware breakpoint for address %#x", siginfo.addr)
+*/
+	return fmt.Errorf("hw breakpoint not supported")
+}
+
+func (t *nativeThread) writeHardwareBreakpoint(addr uint64, wtype proc.WatchType, idx uint8) error {
+/* 	wpstate, err := t.getWatchpoints()
+	if err != nil {
+		return err
+	}
+	if idx >= wpstate.num {
+		return errors.New("hardware breakpoints exhausted")
+	}
+
+	const (
+		readBreakpoint  = 0x1
+		writeBreakpoint = 0x2
+		lenBitOffset    = 5
+		typeBitOffset   = 3
+		privBitOffset   = 1
+	)
+
+	var typ uint64
+	if wtype.Read() {
+		typ |= readBreakpoint
+	}
+	if wtype.Write() {
+		typ |= writeBreakpoint
+	}
+
+	len := uint64((1 << wtype.Size()) - 1) // arm wants the length expressed as address bitmask
+
+	priv := uint64(3)
+
+	ctrl := (len << lenBitOffset) | (typ << typeBitOffset) | (priv << privBitOffset) | 1
+	wpstate.set(idx, addr, ctrl)
+
+	return t.setWatchpoints(wpstate)
+ */
+	return fmt.Errorf("hw breakpoint not supported")
+}
+
+func (t *nativeThread) clearHardwareBreakpoint(addr uint64, wtype proc.WatchType, idx uint8) error {
+/*	wpstate, err := t.getWatchpoints()
+	if err != nil {
+		return err
+	}
+	if idx >= wpstate.num {
+		return errors.New("hardware breakpoints exhausted")
+	}
+	wpstate.set(idx, 0, 0)
+	return t.setWatchpoints(wpstate)
+*/
+	return fmt.Errorf("hw breakpoint not supported")
+}
