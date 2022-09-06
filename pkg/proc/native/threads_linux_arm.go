@@ -47,7 +47,9 @@ func (t *nativeThread) restoreRegisters(savedRegs proc.Registers) error {
 }
 
 // resolvePCForArm is used to resolve all next PC for current instruction.
-func (t *nativeThread) resolvePC(regs proc.Registers) ([]uint64, error) {
+func (t *nativeThread) resolvePC(savedRegs proc.Registers) ([]uint64, error) {
+	regs := savedRegs.(*linutil.ARMRegisters)
+
 	// Use ptrace to get better performance.
 	nextInstrLen := t.BinInfo().Arch.MaxInstructionLength()
 	nextInstrBytes := make([]byte, nextInstrLen)
@@ -257,7 +259,7 @@ func (t *nativeThread) findHardwareBreakpoint() (*proc.Breakpoint, error) {
 
 	return nil, fmt.Errorf("could not find hardware breakpoint for address %#x", siginfo.addr)
 */
-	return fmt.Errorf("hw breakpoint not supported")
+	return nil, fmt.Errorf("hw breakpoint not supported")
 }
 
 func (t *nativeThread) writeHardwareBreakpoint(addr uint64, wtype proc.WatchType, idx uint8) error {

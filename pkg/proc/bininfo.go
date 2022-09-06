@@ -1539,6 +1539,7 @@ func (bi *BinaryInfo) setGStructOffsetElf(image *Image, exe *elf.File, wg *sync.
 		bi.gStructOffset = ^(memsz) + 1 + tlsg.Value // -tls.Memsz + tlsg.Value
 
 	case elf.EM_AARCH64:
+	case elf.EM_ARM: //?? TODO: is this correct?
 		tlsg := getSymbol(image, bi.logger, exe, "runtime.tls_g")
 		if tlsg == nil || tls == nil {
 			bi.gStructOffset = 2 * uint64(bi.Arch.PtrSize())
