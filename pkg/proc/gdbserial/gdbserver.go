@@ -247,7 +247,7 @@ func newProcess(process *os.Process) *gdbProcess {
 		fallthrough
 	case "amd64":
 		p.breakpointKind = 1
-	case "arm64":
+	case "arm64":  //?? TODO ARM
 		p.breakpointKind = 4
 	}
 
@@ -256,7 +256,7 @@ func newProcess(process *os.Process) *gdbProcess {
 	p.regnames.BP = registerName(p.bi.Arch, p.bi.Arch.BPRegNum)
 
 	switch p.bi.Arch.Name {
-	case "arm64":
+	case "arm64":  //?? TODO ARM
 		p.regnames.BP = "fp"
 		p.regnames.CX = "x0"
 	case "amd64":
@@ -351,6 +351,7 @@ func (p *gdbProcess) Connect(conn net.Conn, path string, pid int, debugInfoDirs 
 	}
 
 	if p.bi.Arch.Name != "arm64" {
+		//?? TODO ARM
 		// None of the stubs we support returns the value of fs_base or gs_base
 		// along with the registers, therefore we have to resort to executing a MOV
 		// instruction on the inferior to find out where the G struct of a given
@@ -627,6 +628,7 @@ func LLDBAttach(pid int, path string, debugInfoDirs []string) (*proc.Target, err
 func (p *gdbProcess) EntryPoint() (uint64, error) {
 	var entryPoint uint64
 	if p.bi.GOOS == "darwin" && p.bi.Arch.Name == "arm64" {
+		//?? TODO ARM
 		// There is no auxv on darwin, however, we can get the location of the mach-o
 		// header from the debugserver by going through the loaded libraries, which includes
 		// the exe itself
@@ -1661,6 +1663,7 @@ func (t *gdbThread) reloadRegisters() error {
 	}
 
 	if t.p.bi.Arch.Name == "arm64" {
+		//?? TODO ARM
 		// no need to play around with the GInstr on ARM64 because
 		// the G addr is stored in a register
 
@@ -1963,6 +1966,7 @@ func (t *gdbThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
 		}
 	}
 	if !ok && t.p.bi.Arch.Name == "arm64" && regName == "x30" {
+		//?? TODO ARM
 		gdbreg, ok = t.regs.regs["lr"]
 	}
 	if !ok && regName == "rflags" {

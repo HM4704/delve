@@ -49,7 +49,7 @@ func (i StreamType) String() string {
 
 const (
 	_Arch_name_0 = "CpuArchitectureX86CpuArchitectureMipsCpuArchitectureAlphaCpuArchitecturePPCCpuArchitectureSHXCpuArchitectureARMCpuArchitectureIA64CpuArchitectureAlpha64CpuArchitectureMSILCpuArchitectureAMD64CpuArchitectureWoW64"
-	_Arch_name_1 = "CpuArchitectureARM64"
+	_Arch_name_1 = "CpuArchitectureARM64"  //?? TODO ARM
 	_Arch_name_2 = "CpuArchitectureUnknown"
 )
 

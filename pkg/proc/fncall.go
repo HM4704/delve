@@ -331,6 +331,7 @@ func evalFunctionCall(scope *EvalScope, node *ast.CallExpr) (*Variable, error) {
 			return nil, err
 		}
 	case "arm64":
+	case "arm":  //?? TODO ist this correct?
 		// debugCallV2 on arm64 needs a special call sequence, callOP can not be used
 		sp := regs.SP()
 		sp -= 2 * uint64(bi.Arch.PtrSize())
@@ -478,6 +479,11 @@ func callOP(bi *BinaryInfo, thread Thread, regs Registers, callAddr uint64) erro
 		}
 		return setPC(thread, callAddr)
 	case "arm64":
+		if err := setLR(thread, regs.PC()); err != nil {
+			return err
+		}
+		return setPC(thread, callAddr)
+	case "arm":  //?? TODO ist this correct?
 		if err := setLR(thread, regs.PC()); err != nil {
 			return err
 		}
@@ -914,6 +920,7 @@ func funcCallStep(callScope *EvalScope, fncall *functionCallState, thread Thread
 				setSP(thread, cfa)
 				setPC(thread, oldpc)
 			case "arm64":
+			case "arm":  //?? TODO ist this correct?
 				setLR(thread, oldlr)
 				setPC(thread, oldpc)
 			default:
@@ -1239,6 +1246,7 @@ func debugCallProtocolReg(archName string, version int) (uint64, bool) {
 		}
 		return protocolReg, true
 	case "arm64":
+	//?? TODO what for arm?
 		if version == 2 {
 			return regnum.ARM64_X0 + 20, true
 		}
@@ -1296,6 +1304,7 @@ func regabiMallocgcWorkaround(bi *BinaryInfo) ([]*godwarf.Tree, error) {
 		}
 		return r, err1
 	case "arm64":
+		//?? TODO what todo for ARM?
 		r := []*godwarf.Tree{
 			m("size", t("uintptr"), regnum.ARM64_X0, false),
 			m("typ", t("*runtime._type"), regnum.ARM64_X0+1, false),

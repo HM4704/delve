@@ -9204,6 +9204,7 @@ var instFormats = [...]instFormat{
 	{0x0fe00090, 0x01c00010, 4, BIC_EQ, 0x14011c04, instArgs{arg_R_12, arg_R_16, arg_R_shift_R}},                  // BIC{S}<c> <Rd>,<Rn>,<Rm>,<type> <Rs> cond:4|0|0|0|1|1|1|0|S|Rn:4|Rd:4|Rs:4|0|type:2|1|Rm:4
 	{0x0fe00010, 0x01c00000, 2, BIC_EQ, 0x14011c04, instArgs{arg_R_12, arg_R_16, arg_R_shift_imm}},                // BIC{S}<c> <Rd>,<Rn>,<Rm>{,<shift>} cond:4|0|0|0|1|1|1|0|S|Rn:4|Rd:4|imm5:5|type:2|0|Rm:4
 	{0x0ff000f0, 0x01200070, 4, BKPT_EQ, 0x1c04, instArgs{arg_imm_12at8_4at0}},                                    // BKPT<c> #<imm12+4> cond:4|0|0|0|1|0|0|1|0|imm12:12|0|1|1|1|imm4:4
+	{0xffffffff, 0xf001f0e7, 4, BKPT, 0x0, instArgs{}},	 //?? TODO ARM					                                       // BKPT<c> #<imm12+4> cond:4|0|0|0|1|0|0|1|0|imm12:12|0|1|1|1|imm4:4
 	{0x0f000000, 0x0b000000, 4, BL_EQ, 0x1c04, instArgs{arg_label24}},                                             // BL<c> <label24> cond:4|1|0|1|1|imm24:24
 	{0xfe000000, 0xfa000000, 4, BLX, 0x0, instArgs{arg_label24H}},                                                 // BLX <label24H> 1|1|1|1|1|0|1|H|imm24:24
 	{0x0ffffff0, 0x012fff30, 4, BLX_EQ, 0x1c04, instArgs{arg_R_0}},                                                // BLX<c> <Rm> cond:4|0|0|0|1|0|0|1|0|(1)|(1)|(1)|(1)|(1)|(1)|(1)|(1)|(1)|(1)|(1)|(1)|0|0|1|1|Rm:4

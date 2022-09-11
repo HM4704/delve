@@ -1,6 +1,7 @@
 package native
 
 import (
+	"os"
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"math/bits"
 	"syscall"
 	"unsafe"
+	"bytes"
 
 	sys "golang.org/x/sys/unix"
 
@@ -17,7 +19,7 @@ import (
 
 func (t *nativeThread) fpRegisters() ([]proc.Register, []byte, error) {
 	var err error
-	var arm_fpregs linutil.ARM64PtraceFpRegs
+	var arm_fpregs linutil.ARMPtraceFpRegs
 	t.dbp.execPtraceFunc(func() { arm_fpregs.Vregs, err = ptraceGetFpRegset(t.ID) })
 	fpregs := arm_fpregs.Decode()
 	if err != nil {
@@ -46,6 +48,32 @@ func (t *nativeThread) restoreRegisters(savedRegs proc.Registers) error {
 	return restoreRegistersErr
 }
 
+func pokeMemory(pid int, addr uintptr, data []byte) (count int, err error) {
+	count = 0;
+	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/mem", pid), os.O_RDWR, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	_, err = f.Seek(int64(addr), os.SEEK_SET)
+	if err != nil {
+		return 0, err
+	}
+	count, err = f.Write(data)
+	if count != len(data) || err != nil {
+		return 0, err
+	}
+	return count, err
+}
+
+func flushCache(start uintptr, end uintptr) {
+//	fmt.Printf("flushCache %x\n", start)
+	_, _, err := syscall.Syscall(0x0f0002, start, end, 0)
+	if err != syscall.Errno(0) {
+		fmt.Printf("flushCache err=%x\n", err)
+	}
+}
+
 // resolvePCForArm is used to resolve all next PC for current instruction.
 func (t *nativeThread) resolvePC(savedRegs proc.Registers) ([]uint64, error) {
 	regs := savedRegs.(*linutil.ARMRegisters)
@@ -63,6 +91,13 @@ func (t *nativeThread) resolvePC(savedRegs proc.Registers) ([]uint64, error) {
 	nextPcs := []uint64{
 		regs.PC() + uint64(nextInstrLen),
 	}
+
+	// There is some thing special on ARM platform, we use UND as break instruction.
+	if bytes.Equal(nextInstrBytes, t.BinInfo().Arch.BreakpointInstruction()) {
+		//fmt.Println("found armBreakInstruction")
+		//nextPcs = append(nextPcs, regs.PC()+uint64(4))
+		return nextPcs, nil
+	}
 	// Golang always use ARM mode.
 	nextInstr, err := armasm.Decode(nextInstrBytes, armasm.ModeARM)
 	if err != nil {
@@ -72,6 +107,7 @@ func (t *nativeThread) resolvePC(savedRegs proc.Registers) ([]uint64, error) {
 	case armasm.BL, armasm.BLX, armasm.B, armasm.BX:
 		switch arg := nextInstr.Args[0].(type) {
 		case armasm.Imm:
+			//fmt.Println("armasm.Imm")
 			nextPcs = append(nextPcs, uint64(arg))
 		case armasm.Reg:
 			pc, err := regs.Get(int(arg))
@@ -188,7 +224,8 @@ func (t *nativeThread) singleStep() (err error) {
 			if err != nil {
 				return err
 			}
-			_, err = sys.PtracePokeData(t.ID, addr, instr)
+			_, err = pokeMemory(t.ID, addr, instr)
+			//?? TODO_, err = sys.PtracePokeData(t.ID, addr, instr)
 			if err != nil {
 				return err
 			}
@@ -210,7 +247,8 @@ func (t *nativeThread) singleStep() (err error) {
 		t.dbp.execPtraceFunc(func() {
 			for addr, originalData := range originalDatas {
 				if originalData != nil {
-					_, err = sys.PtracePokeData(t.ID, addr, originalData)
+					//?? TODO_, err = sys.PtracePokeData(t.ID, addr, originalData)
+					_, err = pokeMemory(t.ID, addr, originalData)
 				}
 			}
 		})
@@ -232,14 +270,34 @@ func (t *nativeThread) singleStep() (err error) {
 			}
 			return proc.ErrProcessExited{Pid: t.dbp.pid, Status: rs}
 		}
-		if wpid == t.ID && status.StopSignal() == sys.SIGTRAP {
-			return nil
+		if wpid == t.ID {
+			sig := 0
+			switch s := status.StopSignal(); s {
+			case sys.SIGTRAP:
+				//fmt.Println("rcvd SIGTRAP")
+				return nil
+			case sys.SIGSTOP:
+				// delayed SIGSTOP, ignore it
+				//fmt.Println("rcvd SIGSTOP")
+			case sys.SIGILL, sys.SIGBUS, sys.SIGFPE, sys.SIGSEGV, sys.SIGSTKFLT:
+				//fmt.Println("rcvd SIGILL...")
+				// propagate signals that can have been caused by the current instruction
+				sig = int(s)
+			default:
+				// delay propagation of all other signals
+				fmt.Println("rcvd Other")
+				t.os.delayedSignal = int(s)
+			}
+			err = ptraceCont(t.ID, sig)
+			if err != nil {
+				return err
+			}
 		}
 	}
 }
 
 func (t *nativeThread) findHardwareBreakpoint() (*proc.Breakpoint, error) {
-/*	var siginfo ptraceSiginfoArm64
+/*	var siginfo ptraceSiginfoArm
 	var err error
 	t.dbp.execPtraceFunc(func() {
 		_, _, err = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_GETSIGINFO, uintptr(t.ID), 0, uintptr(unsafe.Pointer(&siginfo)), 0, 0)

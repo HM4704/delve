@@ -253,7 +253,8 @@ func (dbp *nativeProcess) initialize(path string, debugInfoDirs []string) (*proc
 		//    look like the breakpoint was hit twice when it was "logically" only
 		//    executed once.
 		//    See: https://go-review.googlesource.com/c/go/+/208126
-		DisableAsyncPreempt: runtime.GOOS == "windows" || runtime.GOOS == "freebsd" || (runtime.GOOS == "linux" && runtime.GOARCH == "arm64"),
+		DisableAsyncPreempt: runtime.GOOS == "windows" || runtime.GOOS == "freebsd" || (runtime.GOOS == "linux" && runtime.GOARCH == "arm64")  || 
+					(runtime.GOOS == "linux" && runtime.GOARCH == "arm"),  //?? TODO is this correct
 
 		StopReason:   stopReason,
 		CanDump:      runtime.GOOS == "linux" || (runtime.GOOS == "windows" && runtime.GOARCH == "amd64"),
@@ -262,7 +263,7 @@ func (dbp *nativeProcess) initialize(path string, debugInfoDirs []string) (*proc
 	if err != nil {
 		return nil, err
 	}
-	if dbp.bi.Arch.Name == "arm64" {
+	if dbp.bi.Arch.Name == "arm64" || dbp.bi.Arch.Name == "arm" {  //?? TODO is this correct
 		dbp.iscgo = tgt.IsCgo()
 	}
 	return tgt, nil

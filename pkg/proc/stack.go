@@ -239,6 +239,10 @@ func (it *stackIterator) switchToGoroutineStack() {
 	if it.bi.Arch.Name == "arm64" {
 		it.regs.Reg(it.regs.LRRegNum).Uint64Val = it.g.LR
 	}
+	if it.bi.Arch.Name == "arm" {
+		//?? TODO is this correct
+		it.regs.Reg(it.regs.LRRegNum).Uint64Val = it.g.LR
+	}
 }
 
 // Frame returns the frame the iterator is pointing at.
@@ -435,7 +439,7 @@ func (it *stackIterator) advanceRegs() (callFrameRegs op.DwarfRegisters, ret uin
 		}
 	}
 
-	if it.bi.Arch.Name == "arm64" {
+	if it.bi.Arch.Name == "arm64" || it.bi.Arch.Name == "arm"  /* //?? TODO is this correct */ {
 		if ret == 0 && it.regs.Reg(it.regs.LRRegNum) != nil {
 			ret = it.regs.Reg(it.regs.LRRegNum).Uint64Val
 		}

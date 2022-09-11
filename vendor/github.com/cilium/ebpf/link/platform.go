@@ -17,6 +17,8 @@ func platformPrefix(symbol string) string {
 		prefix = "x64"
 	case "arm64", "arm64be":
 		prefix = "arm64"
+	case "arm":  //?? TODO ARM
+		prefix = "arm"
 	default:
 		return symbol
 	}

@@ -8,6 +8,8 @@ import (
 	"bytes"
 
 	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
+
 	"golang.org/x/arch/arm/armasm"
 )
 
@@ -135,3 +137,11 @@ func (inst *armArchInst) OpcodeEquals(op uint64) bool {
 	}
 	return uint64(inst.Op) == op
 }
+
+var armAsmRegisters = func() map[int]asmRegister {
+	r := make(map[int]asmRegister)
+	for i := armasm.R0; i <= armasm.R15; i++ {
+		r[int(i)] = asmRegister{regnum.ARM_R0 + uint64(i-armasm.R0), 0, 0}
+	}
+	return r
+}()

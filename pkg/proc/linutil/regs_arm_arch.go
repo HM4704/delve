@@ -148,8 +148,8 @@ func (r *ARMRegisters) SetReg(regNum uint64, reg *op.DwarfRegister) (fpchanged b
 		return false, nil
 	default:
 		switch {
-		case regNum >= regnum.ARM_X0 && regNum <= regnum.ARM_X0+30:
-			r.Regs.Uregs[regNum-regnum.ARM_X0] = uint32(reg.Uint64Val)
+		case regNum >= regnum.ARM_R0 && regNum <= regnum.ARM_R0+15:
+			r.Regs.Uregs[regNum-regnum.ARM_R0] = uint32(reg.Uint64Val)
 			return false, nil
 
 		case regNum >= regnum.ARM_V0 && regNum <= regnum.ARM_V0+30:

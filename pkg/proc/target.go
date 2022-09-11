@@ -267,6 +267,7 @@ func (t *Target) Valid() (bool, error) {
 // function calls.
 func (t *Target) SupportsFunctionCalls() bool {
 	return t.Process.BinInfo().Arch.Name == "amd64" || t.Process.BinInfo().Arch.Name == "arm64"
+	//?? TODO ARM
 }
 
 // ClearCaches clears internal caches that should not survive a restart.

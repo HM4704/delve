@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-delve/delve/pkg/dwarf/frame"
 	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/regnum"
 )
 
 const (
@@ -40,6 +41,16 @@ func ARMArch(goos string) *Arch {
 		DwarfRegisterToString:            armDwarfRegisterToString,
 		inhibitStepInto:                  func(*BinaryInfo, uint64) bool { return false },
 		asmDecode:                        armAsmDecode,
+		usesLR:                           true,
+		PCRegNum:                         regnum.ARM_PC,
+		SPRegNum:                         regnum.ARM_SP,
+		ContextRegNum:                    regnum.ARM_R0 + 26,  //?? TODO value
+		LRRegNum:                         regnum.ARM_LR,
+		asmRegisters:                     armAsmRegisters,
+		RegisterNameToDwarf:              nameToDwarfFunc(regnum.ARMNameToDwarf),
+		RegnumToString:                   regnum.ARMToName,
+		debugCallMinStackSize:            288,
+		maxRegArgBytes:                   16*4 + 16*4, // 16 int argument registers plus 16 float argument registers
 	}
 }
 
