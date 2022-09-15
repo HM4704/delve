@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+	"os"
+	"fmt"
 )
 
 /*
@@ -1681,12 +1683,31 @@ func ptracePoke(pokeReq int, peekReq int, pid int, addr uintptr, data []byte) (c
 	return n, nil
 }
 
+func pokeMemory(pid int, addr uintptr, data []byte) (count int, err error) {
+	count = 0;
+	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/task/%d/mem", pid, pid), os.O_RDWR, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	_, err = f.Seek(int64(addr), os.SEEK_SET)
+	if err != nil {
+		return 0, err
+	}
+	count, err = f.Write(data)
+	if count != len(data) || err != nil {
+		return 0, err
+	}
+	return count, err
+}
+
 func PtracePokeText(pid int, addr uintptr, data []byte) (count int, err error) {
 	return ptracePoke(PTRACE_POKETEXT, PTRACE_PEEKTEXT, pid, addr, data)
 }
 
 func PtracePokeData(pid int, addr uintptr, data []byte) (count int, err error) {
-	return ptracePoke(PTRACE_POKEDATA, PTRACE_PEEKDATA, pid, addr, data)
+	return pokeMemory(pid, addr, data)
+//?? TODO	return ptracePoke(PTRACE_POKEDATA, PTRACE_PEEKDATA, pid, addr, data)
 }
 
 func PtracePokeUser(pid int, addr uintptr, data []byte) (count int, err error) {

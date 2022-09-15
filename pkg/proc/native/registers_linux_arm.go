@@ -21,8 +21,10 @@ const (
 func ptraceGetGRegs(pid int, regs *linutil.ARMPtraceRegs) (err error) {
 	iov := sys.Iovec{Base: (*byte)(unsafe.Pointer(regs)), Len: _ARM_GREGS_SIZE}
 	_, _, err = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_GETREGSET, uintptr(pid), uintptr(elf.NT_PRSTATUS), uintptr(unsafe.Pointer(&iov)), 0, 0)
-	if err == syscall.Errno(0) {
+    if err == syscall.Errno(0) {
 		err = nil
+	} else {
+		fmt.Printf("ptraceGetGRegs() err=%v\n", err)
 	}
 	return
 }

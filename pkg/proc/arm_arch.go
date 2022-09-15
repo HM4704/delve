@@ -146,9 +146,14 @@ const armCgocallSPOffsetSaveSlot = 0x4
 const armPrevG0schedSPOffsetSaveSlot = 0x8
 
 func armSwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool {
+	if it.frame.Current.Fn == nil && it.systemstack && it.g != nil && it.top {
+		it.switchToGoroutineStack()
+		fmt.Println("switchToGoroutineStack()")
+		return true
+	}
 	if it.frame.Current.Fn != nil {
 		switch it.frame.Current.Fn.Name {
-		case "runtime.asmcgocall", "runtime.cgocallback_gofunc", "runtime.sigpanic":
+		case "runtime.asmcgocall", "runtime.cgocallback_gofunc", "runtime.sigpanic", "runtime.cgocallback":
 			//do nothing
 		case "runtime.goexit", "runtime.rt0_go", "runtime.mcall":
 			// Look for "top of stack" functions.
@@ -170,7 +175,7 @@ func armSwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool {
 			it.pc = newlr
 			return true
 		default:
-			if it.systemstack && it.top && it.g != nil && strings.HasPrefix(it.frame.Current.Fn.Name, "runtime.") && it.frame.Current.Fn.Name != "runtime.fatalthrow" {
+			if it.systemstack && it.top && it.g != nil && strings.HasPrefix(it.frame.Current.Fn.Name, "runtime.") && it.frame.Current.Fn.Name != "runtime.throw" && it.frame.Current.Fn.Name != "runtime.fatalthrow" {
 				// The runtime switches to the system stack in multiple places.
 				// This usually happens through a call to runtime.systemstack but there
 				// are functions that switch to the system stack manually (for example
@@ -211,7 +216,7 @@ func armSwitchStack(it *stackIterator, callFrameRegs *op.DwarfRegisters) bool {
 		callFrameRegs.Reg(callFrameRegs.SPRegNum).Uint64Val = uint64(int64(newsp))
 		return false
 
-	case "runtime.cgocallback_gofunc":
+	case "runtime.cgocallback_gofunc", "runtime.cgocallback":
 		// For a detailed description of how this works read the long comment at
 		// the start of $GOROOT/src/runtime/cgocall.go and the source code of
 		// runtime.cgocallback_gofunc in $GOROOT/src/runtime/asm_arm.s

@@ -50,7 +50,7 @@ func (t *nativeThread) restoreRegisters(savedRegs proc.Registers) error {
 
 func pokeMemory(pid int, addr uintptr, data []byte) (count int, err error) {
 	count = 0;
-	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/mem", pid), os.O_RDWR, 0)
+	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/task/%d/mem", pid, pid), os.O_RDWR, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -239,7 +239,6 @@ func (t *nativeThread) singleStep() (err error) {
 				return
 			}
 		}
-		err = ptraceCont(t.ID, 0)
 	})
 	// Make sure we restore before return.
 	defer func() {
@@ -257,7 +256,14 @@ func (t *nativeThread) singleStep() (err error) {
 		return err
 	}
 	for {
-		// To be able to catch process exit, we can only use wait instead of waitFast.
+		sig := 0
+		t.dbp.execPtraceFunc(func() {
+			err = ptraceCont(t.ID, sig)
+		})
+		if err != nil {
+			return err
+		}		
+	// To be able to catch process exit, we can only use wait instead of waitFast.
 		wpid, status, err := t.dbp.wait(t.ID, 0)
 		if err != nil {
 			return err
@@ -271,26 +277,29 @@ func (t *nativeThread) singleStep() (err error) {
 			return proc.ErrProcessExited{Pid: t.dbp.pid, Status: rs}
 		}
 		if wpid == t.ID {
-			sig := 0
+			sig = 0
 			switch s := status.StopSignal(); s {
-			case sys.SIGTRAP:
-				//fmt.Println("rcvd SIGTRAP")
+			case sys.SIGTRAP:				
+			/*
+   				regs, err := t.Registers()
+				if err != nil {
+					return err
+				}
+				fmt.Printf("rcvd SIGTRAP at %x\n", regs.PC())
+			*/	
 				return nil
 			case sys.SIGSTOP:
 				// delayed SIGSTOP, ignore it
-				//fmt.Println("rcvd SIGSTOP")
+				fmt.Println("rcvd SIGSTOP")
 			case sys.SIGILL, sys.SIGBUS, sys.SIGFPE, sys.SIGSEGV, sys.SIGSTKFLT:
 				//fmt.Println("rcvd SIGILL...")
 				// propagate signals that can have been caused by the current instruction
+				fmt.Printf("rcvd other %s\n", s)
 				sig = int(s)
 			default:
 				// delay propagation of all other signals
 				fmt.Println("rcvd Other")
 				t.os.delayedSignal = int(s)
-			}
-			err = ptraceCont(t.ID, sig)
-			if err != nil {
-				return err
 			}
 		}
 	}
