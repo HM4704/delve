@@ -1,15 +1,16 @@
 package native
 
 import (
-	"os"
+	"bytes"
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
-	"golang.org/x/arch/arm/armasm"
 	"math/bits"
+	"os"
 	"syscall"
 	"unsafe"
-	"bytes"
+
+	"golang.org/x/arch/arm/armasm"
 
 	sys "golang.org/x/sys/unix"
 
@@ -49,7 +50,7 @@ func (t *nativeThread) restoreRegisters(savedRegs proc.Registers) error {
 }
 
 func pokeMemory(pid int, addr uintptr, data []byte) (count int, err error) {
-	count = 0;
+	count = 0
 	f, err := os.OpenFile(fmt.Sprintf("/proc/%d/task/%d/mem", pid, pid), os.O_RDWR, 0)
 	if err != nil {
 		return 0, err
@@ -63,11 +64,12 @@ func pokeMemory(pid int, addr uintptr, data []byte) (count int, err error) {
 	if count != len(data) || err != nil {
 		return 0, err
 	}
+	flushCache(addr, addr+uintptr(len(data)))
 	return count, err
 }
 
 func flushCache(start uintptr, end uintptr) {
-//	fmt.Printf("flushCache %x\n", start)
+	//	fmt.Printf("flushCache %x\n", start)
 	_, _, err := syscall.Syscall(0x0f0002, start, end, 0)
 	if err != syscall.Errno(0) {
 		fmt.Printf("flushCache err=%x\n", err)
@@ -107,7 +109,6 @@ func (t *nativeThread) resolvePC(savedRegs proc.Registers) ([]uint64, error) {
 	case armasm.BL, armasm.BLX, armasm.B, armasm.BX:
 		switch arg := nextInstr.Args[0].(type) {
 		case armasm.Imm:
-			//fmt.Println("armasm.Imm")
 			nextPcs = append(nextPcs, uint64(arg))
 		case armasm.Reg:
 			pc, err := regs.Get(int(arg))
@@ -116,8 +117,9 @@ func (t *nativeThread) resolvePC(savedRegs proc.Registers) ([]uint64, error) {
 			}
 			nextPcs = append(nextPcs, pc)
 		case armasm.PCRel:
-			nextPcs = append(nextPcs, regs.PC()+uint64(arg))
+			nextPcs = append(nextPcs, regs.PC()+uint64(arg)+8) //?? TODO +8 jump over prologue
 		}
+
 	case armasm.POP:
 		if regList, ok := nextInstr.Args[0].(armasm.RegList); ok && (regList&(1<<uint(armasm.PC)) != 0) {
 			pc, err := regs.Get(int(armasm.SP))
@@ -262,8 +264,8 @@ func (t *nativeThread) singleStep() (err error) {
 		})
 		if err != nil {
 			return err
-		}		
-	// To be able to catch process exit, we can only use wait instead of waitFast.
+		}
+		// To be able to catch process exit, we can only use wait instead of waitFast.
 		wpid, status, err := t.dbp.wait(t.ID, 0)
 		if err != nil {
 			return err
@@ -279,14 +281,14 @@ func (t *nativeThread) singleStep() (err error) {
 		if wpid == t.ID {
 			sig = 0
 			switch s := status.StopSignal(); s {
-			case sys.SIGTRAP:				
-			/*
-   				regs, err := t.Registers()
-				if err != nil {
-					return err
-				}
-				fmt.Printf("rcvd SIGTRAP at %x\n", regs.PC())
-			*/	
+			case sys.SIGTRAP:
+				/*
+					regs, err := t.Registers()
+					if err != nil {
+						return err
+					}
+					fmt.Printf("rcvd SIGTRAP at %x\n", regs.PC())
+				*/
 				return nil
 			case sys.SIGSTOP:
 				// delayed SIGSTOP, ignore it
@@ -306,76 +308,76 @@ func (t *nativeThread) singleStep() (err error) {
 }
 
 func (t *nativeThread) findHardwareBreakpoint() (*proc.Breakpoint, error) {
-/*	var siginfo ptraceSiginfoArm
-	var err error
-	t.dbp.execPtraceFunc(func() {
-		_, _, err = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_GETSIGINFO, uintptr(t.ID), 0, uintptr(unsafe.Pointer(&siginfo)), 0, 0)
-	})
-	if err != syscall.Errno(0) {
-		return nil, err
-	}
-	if siginfo.signo != uint32(sys.SIGTRAP) || (siginfo.code&0xffff) != _TRAP_HWBKPT {
-		return nil, nil
-	}
-
-	for _, bp := range t.dbp.Breakpoints().M {
-		if bp.WatchType != 0 && siginfo.addr >= bp.Addr && siginfo.addr < bp.Addr+uint64(bp.WatchType.Size()) {
-			return bp, nil
+	/*	var siginfo ptraceSiginfoArm
+		var err error
+		t.dbp.execPtraceFunc(func() {
+			_, _, err = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_GETSIGINFO, uintptr(t.ID), 0, uintptr(unsafe.Pointer(&siginfo)), 0, 0)
+		})
+		if err != syscall.Errno(0) {
+			return nil, err
 		}
-	}
+		if siginfo.signo != uint32(sys.SIGTRAP) || (siginfo.code&0xffff) != _TRAP_HWBKPT {
+			return nil, nil
+		}
 
-	return nil, fmt.Errorf("could not find hardware breakpoint for address %#x", siginfo.addr)
-*/
+		for _, bp := range t.dbp.Breakpoints().M {
+			if bp.WatchType != 0 && siginfo.addr >= bp.Addr && siginfo.addr < bp.Addr+uint64(bp.WatchType.Size()) {
+				return bp, nil
+			}
+		}
+
+		return nil, fmt.Errorf("could not find hardware breakpoint for address %#x", siginfo.addr)
+	*/
 	return nil, fmt.Errorf("hw breakpoint not supported")
 }
 
 func (t *nativeThread) writeHardwareBreakpoint(addr uint64, wtype proc.WatchType, idx uint8) error {
-/* 	wpstate, err := t.getWatchpoints()
-	if err != nil {
-		return err
-	}
-	if idx >= wpstate.num {
-		return errors.New("hardware breakpoints exhausted")
-	}
+	/* 	wpstate, err := t.getWatchpoints()
+	   	if err != nil {
+	   		return err
+	   	}
+	   	if idx >= wpstate.num {
+	   		return errors.New("hardware breakpoints exhausted")
+	   	}
 
-	const (
-		readBreakpoint  = 0x1
-		writeBreakpoint = 0x2
-		lenBitOffset    = 5
-		typeBitOffset   = 3
-		privBitOffset   = 1
-	)
+	   	const (
+	   		readBreakpoint  = 0x1
+	   		writeBreakpoint = 0x2
+	   		lenBitOffset    = 5
+	   		typeBitOffset   = 3
+	   		privBitOffset   = 1
+	   	)
 
-	var typ uint64
-	if wtype.Read() {
-		typ |= readBreakpoint
-	}
-	if wtype.Write() {
-		typ |= writeBreakpoint
-	}
+	   	var typ uint64
+	   	if wtype.Read() {
+	   		typ |= readBreakpoint
+	   	}
+	   	if wtype.Write() {
+	   		typ |= writeBreakpoint
+	   	}
 
-	len := uint64((1 << wtype.Size()) - 1) // arm wants the length expressed as address bitmask
+	   	len := uint64((1 << wtype.Size()) - 1) // arm wants the length expressed as address bitmask
 
-	priv := uint64(3)
+	   	priv := uint64(3)
 
-	ctrl := (len << lenBitOffset) | (typ << typeBitOffset) | (priv << privBitOffset) | 1
-	wpstate.set(idx, addr, ctrl)
+	   	ctrl := (len << lenBitOffset) | (typ << typeBitOffset) | (priv << privBitOffset) | 1
+	   	wpstate.set(idx, addr, ctrl)
 
-	return t.setWatchpoints(wpstate)
- */
+	   	return t.setWatchpoints(wpstate)
+	*/
 	return fmt.Errorf("hw breakpoint not supported")
 }
 
 func (t *nativeThread) clearHardwareBreakpoint(addr uint64, wtype proc.WatchType, idx uint8) error {
-/*	wpstate, err := t.getWatchpoints()
-	if err != nil {
-		return err
-	}
-	if idx >= wpstate.num {
-		return errors.New("hardware breakpoints exhausted")
-	}
-	wpstate.set(idx, 0, 0)
-	return t.setWatchpoints(wpstate)
-*/
+	/*	wpstate, err := t.getWatchpoints()
+		if err != nil {
+			return err
+		}
+		if idx >= wpstate.num {
+			return errors.New("hardware breakpoints exhausted")
+		}
+		wpstate.set(idx, 0, 0)
+		return t.setWatchpoints(wpstate)
+	*/
 	return fmt.Errorf("hw breakpoint not supported")
 }
